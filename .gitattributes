@@ -1,2 +1,14 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Vendored upstream artifacts are verified byte-for-byte against the SHA-256
+# digests in specs/manifest.json (FR-01), so their bytes must survive checkout
+# unchanged on every platform. Under `* text=auto` above, git rewrites LF to
+# CRLF when checking out on Windows, which changes every byte of a 13,809-line
+# JSON document and fails `npm run specs:verify` on a clean clone.
+specs/** -text
+
+# Scripts and the container entrypoint keep LF wherever they are checked out:
+# CRLF in a file Linux executes fails with a confusing "bad interpreter" error.
+*.sh text eol=lf
+Dockerfile text eol=lf
