@@ -7,6 +7,8 @@
  */
 import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test, describe } from 'node:test';
 
 import { buildRegistry } from '../src/registry/build.js';
@@ -20,8 +22,9 @@ import {
 import { advertisedTools, ALL_TOOLS } from '../src/tools/definitions.js';
 import { SERVICE_IDS, type ServiceId } from '../src/types.js';
 
-const REPO_ROOT = new URL('..', import.meta.url).pathname;
-const manifest = JSON.parse(readFileSync(`${REPO_ROOT}specs/manifest.json`, 'utf8'));
+// URL.pathname yields `/D:/a/...` on Windows, which readFileSync cannot open.
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'specs', 'manifest.json'), 'utf8'));
 const allServices = new Set<ServiceId>(SERVICE_IDS);
 
 describe('action IDs', () => {
@@ -67,7 +70,7 @@ describe('never-ship blocklist (FR-46)', () => {
     const known = new Set<string>();
     for (const service of SERVICE_IDS) {
       const spec = JSON.parse(
-        readFileSync(`${REPO_ROOT}${manifest.services[service].path}`, 'utf8'),
+        readFileSync(join(REPO_ROOT, manifest.services[service].path), 'utf8'),
       );
       for (const [path, item] of Object.entries(spec.paths as Record<string, any>)) {
         for (const method of Object.keys(item ?? {})) {

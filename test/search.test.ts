@@ -12,14 +12,17 @@
  */
 import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test, describe } from 'node:test';
 
 import { buildRegistry } from '../src/registry/build.js';
 import { expandConcepts, resourceOf, searchActions } from '../src/tools/search.js';
 import { SERVICE_IDS, type ServiceId } from '../src/types.js';
 
-const REPO_ROOT = new URL('..', import.meta.url).pathname;
-const manifest = JSON.parse(readFileSync(`${REPO_ROOT}specs/manifest.json`, 'utf8'));
+// URL.pathname yields `/D:/a/...` on Windows, which readFileSync cannot open.
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'specs', 'manifest.json'), 'utf8'));
 const { actions } = buildRegistry(REPO_ROOT, manifest, new Set<ServiceId>(SERVICE_IDS));
 
 const rankOf = (query: string, actionId: string, limit = 10): number =>
