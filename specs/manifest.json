@@ -1,0 +1,54 @@
+{
+  "$comment": "Vendored OpenAPI specs. FR-01: pinned versions only, never `latest` (which returns the docs SPA HTML shell with HTTP 200). FR-03: every fetch is validated as an OpenAPI document before it lands here. Regenerate with `npm run specs:refresh`; FR-05 requires version bumps to land as a reviewed pull request.",
+  "fetchedAt": "2026-08-01",
+  "indexUrl": "https://developer.ui.com/llms.txt",
+  "services": {
+    "site-manager": {
+      "version": "1.0.0",
+      "url": "https://developer.ui.com/site-manager/v1.0.0/openapi.json",
+      "path": "specs/site-manager/v1.0.0/openapi.json",
+      "sha256": "5f6610f6c85a22d868c4849ed8136c058b5db016daca4e93d85aa4060c615298",
+      "openapi": "3.0.3",
+      "infoVersion": "1.0.0",
+      "operations": 14,
+      "declaresSecuritySchemes": true,
+      "authInjectionRequired": false
+    },
+    "network": {
+      "version": "10.4.57",
+      "url": "https://developer.ui.com/network/v10.4.57/openapi.json",
+      "path": "specs/network/v10.4.57/openapi.json",
+      "sha256": "3773947b4572b1bdc84272d3d2b9ebb5cad0d9aaa2640c3418568df97c9df59d",
+      "openapi": "3.1.0",
+      "infoVersion": "10.4.57",
+      "operations": 73,
+      "declaresSecuritySchemes": false,
+      "authInjectionRequired": true,
+      "$comment": "FR-06 / R-8: no securitySchemes and no security block. A generator that trusts this spec emits an unauthenticated client."
+    },
+    "protect": {
+      "version": "7.1.87",
+      "url": "https://developer.ui.com/protect/v7.1.87/openapi.json",
+      "path": "specs/protect/v7.1.87/openapi.json",
+      "sha256": "e341e1381db19dfabcafc1e6fbf13ae0afc236d70718beda1d9f54ec9e33c7e1",
+      "openapi": "3.1.0",
+      "infoVersion": "0.0.0",
+      "operations": 73,
+      "declaresSecuritySchemes": false,
+      "authInjectionRequired": true,
+      "$comment": "FR-35: info.version is the stub `0.0.0`; the URL version segment 7.1.87 is authoritative and is what the product reports. FR-06: no securitySchemes. Additionally every one of the 73 operations lacks an operationId, so action IDs are synthesised from method+path (see src/registry/actionId.ts)."
+    },
+    "mobility": {
+      "version": "1.0.0",
+      "url": "https://developer.ui.com/mobility/v1.0.0/openapi.json",
+      "path": "specs/mobility/v1.0.0/openapi.json",
+      "sha256": "a82ffea0e14ee9b3bba342c9723b931d354d0a50477f2e24786faa1085677e1d",
+      "openapi": "3.0.3",
+      "infoVersion": "1.0.0",
+      "operations": 8,
+      "declaresSecuritySchemes": true,
+      "authInjectionRequired": false
+    }
+  },
+  "totalOperations": 168
+}

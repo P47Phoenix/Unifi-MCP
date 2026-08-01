@@ -1,0 +1,43 @@
+{
+  "name": "unifi-mcp",
+  "version": "0.1.0",
+  "description": "MCP server exposing the four published Ubiquiti UniFi developer APIs (Site Manager, Network, Protect, Mobility) as a single tool surface.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "unifi-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "specs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --import tsx test/*.test.ts",
+    "specs:refresh": "tsx scripts/refresh-specs.ts",
+    "specs:verify": "tsx scripts/verify-specs.ts",
+    "coverage:check": "tsx scripts/coverage-check.ts",
+    "budget:check": "tsx scripts/token-budget.ts",
+    "lint:tools": "tsx scripts/lint-tools.ts",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "inspect:cli": "npx @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  },
+  "optionalDependencies": {
+    "keytar": "^7.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

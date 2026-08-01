@@ -1,0 +1,186 @@
+# CI for the UniFi MCP server.
+#
+# NFR-20 requires the server to run on macOS, Linux and Windows, so the matrix is
+# all three rather than ubuntu-only — the paths this project touches (path
+# separators in the spec loader, keychain absence on headless Linux, npx
+# behaviour under PowerShell) are exactly the ones that differ per platform.
+#
+# Node 20 is the single supported major: package.json declares `engines.node
+# >=18.17`, the vendored spec loader and the MCP SDK both target modern Node, and
+# a second Node major in the matrix would triple the run for no covered risk.
+#
+# Step ordering is deliberate — cheapest gate that can fail first:
+#   typecheck  -> compile errors
+#   test       -> unit and contract tests
+#   specs:verify -> offline digest/count check, sub-second, no network (NFR-17)
+#   coverage:check -> registry build + FR-59 coverage
+#   budget:check / lint:tools -> G-3, G-9 gates on the tool surface
+#   build + Inspector --cli -> FR-60 end-to-end smoke test
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # D-3: MCP Inspector is load-bearing (the build skill prescribes it and ships
+  # no test scaffolding of its own), so it is pinned rather than floating. A
+  # floating `@latest` here means a vendor release can turn CI red on a commit
+  # that changed nothing. Bump this deliberately, in its own PR.
+  #
+  # Note: the Inspector declares `engines.node >= 22`, but its CLI runs fine
+  # under npx on Node 20 with an EBADENGINE warning. The server under test is
+  # what must run on Node 20, and it does.
+  INSPECTOR_VERSION: 2.0.0
+
+jobs:
+  verify:
+    name: verify (node 20, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['20']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # R-7: the build skill ships no test scaffolding, so the harness is an M2
+      # deliverable that does not exist yet. The step runs unconditionally and
+      # says so out loud rather than being silently absent from the workflow —
+      - name: Test
+        run: npm test
+
+      # FR-01/FR-05: offline digest and operation-count gate. No network.
+      - name: Verify vendored specs
+        run: npm run specs:verify
+
+      # FR-59/G-1: every spec operation registered or blocklisted with a reason.
+      - name: Coverage check
+        run: npm run coverage:check
+
+      # FR-59 requires the report to be committed so reviewers can diff it across
+      # spec bumps. A drifted report means someone changed the registry or the
+      # blocklist without regenerating it, and the diff a reviewer reads would be
+      # stale.
+      - name: Assert coverage-report.json is committed and current
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          if ! git diff --exit-code -- coverage-report.json; then
+            echo "::error title=Stale coverage report::coverage-report.json differs from the committed copy. Run 'npm run coverage:check' and commit the result (FR-59)."
+            exit 1
+          fi
+
+      # G-3/NFR-18: advertised tools/list schema token budget.
+      - name: Token budget
+        run: npm run budget:check
+
+      # NFR-01..NFR-04, NFR-10, FR-58: directory-review constraints (G-9).
+      - name: Lint tool manifest
+        run: npm run lint:tools
+
+      - name: Build
+        run: npm run build
+
+      # FR-60: MCP Inspector in --cli mode is the smoke test; no bespoke MCP
+      # harness is invented. src/index.ts does not exist yet, so the step guards
+      # on the built entrypoint and goes live automatically when it lands.
+      - name: MCP Inspector CLI smoke test
+        shell: bash
+        run: |
+          if [ ! -f dist/index.js ]; then
+            echo "::notice title=Entrypoint not built::dist/index.js does not exist yet (src/index.ts lands at M3). Skipping the Inspector smoke test (FR-60)."
+            exit 0
+          fi
+
+          echo "Running MCP Inspector ${INSPECTOR_VERSION} --cli against dist/index.js"
+
+          # Placeholder credentials, deliberately. NFR-17 requires the server to
+          # start and advertise its full tool surface with all outbound traffic
+          # blocked, and `tools/list` makes no upstream request — so a syntactically
+          # valid key that authenticates with nothing is exactly the right input,
+          # and CI needs no real secret. UNIFI_CONSOLE_ID switches Network and
+          # Protect on via the Cloud Connector so all four APIs are advertised;
+          # UNIFI_ENABLE_WRITES is needed because FR-44 makes read-only the default
+          # and the write execution tool is otherwise absent from tools/list.
+          #
+          # The Inspector does NOT pass its own environment to the spawned server;
+          # variables must go through its `-e` flag.
+          # FR-60: "The CI job fails the build on a non-zero Inspector exit."
+          if ! npx --yes "@modelcontextprotocol/inspector@${INSPECTOR_VERSION}" \
+                 --cli node dist/index.js \
+                 -e UNIFI_API_KEY=ci-smoke-test-placeholder-key \
+                 -e UNIFI_CONSOLE_ID=0000000000000000 \
+                 -e UNIFI_ENABLE_WRITES=network,protect \
+                 --method tools/list > tools-list.json; then
+            status=$?
+            echo "::error title=Inspector failed::MCP Inspector exited ${status} (FR-60 fails the build on a non-zero exit)."
+            cat tools-list.json || true
+            exit "${status}"
+          fi
+
+          cat tools-list.json
+
+          # Assert the expected tool names are present. The hybrid search+execute
+          # surface (ADR-02) is five promoted read tools, one search tool and two
+          # execution tools — separate because NFR-01 requires it.
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const expected = [
+              "unifi_list_sites",
+              "unifi_list_consoles",
+              "unifi_list_devices",
+              "unifi_list_clients",
+              "unifi_list_cameras",
+              "unifi_search_actions",
+              "unifi_execute_action",
+              "unifi_execute_write_action",
+            ];
+            const payload = JSON.parse(readFileSync("tools-list.json", "utf8"));
+            const tools = payload.tools ?? [];
+            const names = new Set(tools.map((t) => t.name));
+            const missing = expected.filter((n) => !names.has(n));
+            if (missing.length) {
+              console.error("::error title=Missing tools::tools/list is missing: " + missing.join(", "));
+              console.error("advertised: " + [...names].join(", "));
+              process.exit(1);
+            }
+            // FR-18 caps the advertised surface at 12 tools.
+            if (tools.length > 12) {
+              console.error("::error title=Too many tools::tools/list advertises " + tools.length + " tools; FR-18 caps it at 12.");
+              process.exit(1);
+            }
+            console.log("Inspector smoke test OK: " + tools.length + " tools advertised.");
+          '
+
+      - name: Upload tools/list output
+        if: always() && hashFiles('tools-list.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: tools-list-${{ matrix.os }}
+          path: tools-list.json
+          if-no-files-found: ignore
