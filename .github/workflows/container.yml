@@ -1,0 +1,278 @@
+# Build and publish the UniFi MCP container image.
+#
+# ## Native builds, no emulation
+#
+# Each architecture is built on a runner of that architecture — arm64 on
+# `ubuntu-24.04-arm`, amd64 on `ubuntu-latest` — then joined into one
+# multi-arch manifest. GitHub's hosted arm64 runners are free for public
+# repositories, so there is no QEMU anywhere in this workflow. That matters
+# beyond speed: `npm ci` under emulation is slow enough to dominate the build,
+# and an emulated build is a worse test of the artifact than a native one.
+#
+# Per-arch jobs push by digest only (no tags). The `merge` job then creates the
+# tagged manifest list pointing at both digests, which is what `docker pull`
+# resolves against.
+#
+# ## What is published
+#
+# ghcr.io/p47phoenix/unifi-mcp — a **stdio** MCP server. It does not listen on
+# a port; see "Deploying this" in README.md before handing it to a platform
+# team.
+
+name: Container
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/container.yml'
+      - 'src/**'
+      - 'specs/**'
+      - 'package*.json'
+  workflow_dispatch:
+
+env:
+  # Written out in full and already lowercase. `github.repository` would give
+  # `P47Phoenix/Unifi-MCP`, and registry paths must be lowercase — GHCR rejects
+  # the mixed-case form. GitHub expressions have no lowercase function, so
+  # deriving it would need a shell step in every job that references it.
+  REGISTRY_IMAGE: ghcr.io/p47phoenix/unifi-mcp
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          labels: |
+            org.opencontainers.image.title=unifi-mcp
+            org.opencontainers.image.description=MCP server over the four published Ubiquiti UniFi developer APIs. Speaks MCP over stdio; does not listen on a port.
+
+      # A pull_request build produces no image: it exists to prove the
+      # Dockerfile still builds — including the `--selftest` it runs internally
+      # — before the change reaches main.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY_IMAGE) }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish manifest
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.inspect.outputs.digest }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY_IMAGE}"
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+
+      - name: Inspect and capture digest
+        id: inspect
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY_IMAGE}"
+          docker buildx imagetools inspect "${IMAGE}:${DOCKER_METADATA_OUTPUT_VERSION}"
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${DOCKER_METADATA_OUTPUT_VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+        env:
+          DOCKER_METADATA_OUTPUT_VERSION: ${{ steps.meta.outputs.version }}
+
+      # Gives the platform team a verifiable link from image digest back to this
+      # workflow run and commit.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
+          push-to-registry: true
+
+  smoke:
+    name: Smoke-test the arm64 image
+    needs: merge
+    if: github.event_name != 'pull_request'
+    # Natively arm64, so this exercises the image the way the deployment target
+    # will rather than under emulation.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pinned to the digest, so this tests the exact artifact that was
+      # published rather than whatever a mutable tag resolves to later.
+      - name: Artifact self-test
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY_IMAGE}@${{ needs.merge.outputs.digest }}"
+          echo "Testing $IMAGE"
+          docker run --rm "$IMAGE" --selftest | tee /tmp/selftest.json
+          grep -q '"platform": "linux/arm64"' /tmp/selftest.json
+          grep -q '"ok": true' /tmp/selftest.json
+
+      # The self-test proves the artifact is intact; this proves it speaks MCP.
+      # `tools/list` makes no upstream UniFi call (NFR-17), so the placeholder
+      # key never leaves the container and no real secret is needed here.
+      - name: MCP handshake and tools/list
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY_IMAGE}@${{ needs.merge.outputs.digest }}"
+          {
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+          } | docker run -i --rm \
+                -e UNIFI_API_KEY=ci-placeholder \
+                -e UNIFI_LOCAL_HOST=10.0.0.1 \
+                -e UNIFI_LOCAL_API_KEY=ci-placeholder \
+                "$IMAGE" 2>/dev/null > /tmp/mcp.jsonl
+
+          python3 - <<'PY'
+          import json
+          tools = []
+          for line in open('/tmp/mcp.jsonl'):
+              line = line.strip()
+              if not line:
+                  continue
+              msg = json.loads(line)
+              if msg.get('id') == 2:
+                  tools = [t['name'] for t in msg['result']['tools']]
+          expected = {
+              'unifi_list_consoles', 'unifi_list_sites', 'unifi_list_devices',
+              'unifi_list_clients', 'unifi_list_cameras', 'unifi_search_actions',
+              'unifi_execute_action',
+          }
+          missing = expected - set(tools)
+          assert not missing, f'missing tools: {missing}'
+          # FR-44: the write tool must be absent without UNIFI_ENABLE_WRITES.
+          assert 'unifi_execute_write_action' not in tools, 'write tool exposed by default'
+          print(f'OK: {len(tools)} tools, read-only default holds')
+          PY
+
+      - name: Summary
+        run: |
+          {
+            echo "### UniFi MCP image published"
+            echo
+            echo '```'
+            echo "${REGISTRY_IMAGE}@${{ needs.merge.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Platforms: \`linux/arm64\`, \`linux/amd64\` — both built natively."
+            echo
+            echo "This is a **stdio** MCP server. It does not listen on a port; run it"
+            echo "with \`docker run -i\`. See \"Deploying this\" in README.md."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,18 @@
+# Keep the build context small and the image reproducible. Anything the
+# Dockerfile does not explicitly COPY is excluded anyway, but a lean context
+# also means a cache miss on an unrelated file does not invalidate the build.
+
+node_modules
+dist
+.git
+.github
+.probe
+test
+docs
+coverage-report.json
+*.log
+.env
+.DS_Store
+README.md
+Dockerfile
+.dockerignore

@@ -21,7 +21,8 @@ import { loadConfig, validateConfig, redactedSummary } from './config.js';
 import { CredentialStore } from './credentials.js';
 import { UnifiClient } from './http/client.js';
 import { buildRegistry, type SpecManifest } from './registry/build.js';
-import { advertisedTools, createHandlers } from './tools/index.js';
+import { advertisedTools, createHandlers, PROMOTED_ACTION_IDS } from './tools/index.js';
+import { SERVICE_IDS } from './types.js';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -29,7 +30,65 @@ function warn(message: string): void {
   process.stderr.write(`${message}\n`);
 }
 
+/**
+ * Credential-free image/install integrity check (`--selftest`).
+ *
+ * Exists because a container image of a stdio server has no port to probe: a
+ * platform team otherwise has no way to tell a working image from one whose
+ * `specs/` layer was dropped by a bad COPY. Deliberately independent of
+ * credentials and of `UNIFI_*` configuration, so it answers "is this artifact
+ * intact" and not "is this deployment configured" — a health check that fails
+ * on a missing API key would report the wrong problem.
+ *
+ * This path never connects a transport, so writing to stdout here does not
+ * violate NFR-19.
+ */
+function selfTest(): number {
+  const problems: string[] = [];
+  let manifest: SpecManifest;
+  try {
+    manifest = JSON.parse(
+      readFileSync(join(REPO_ROOT, 'specs', 'manifest.json'), 'utf8'),
+    ) as SpecManifest;
+  } catch (e) {
+    process.stdout.write(
+      `${JSON.stringify({ ok: false, error: `specs/manifest.json unreadable at ${REPO_ROOT}: ${String(e)}` })}\n`,
+    );
+    return 1;
+  }
+
+  // Every service, regardless of configuration: this checks the artifact.
+  const registry = buildRegistry(REPO_ROOT, manifest, new Set(SERVICE_IDS));
+  const tools = advertisedTools(new Set(SERVICE_IDS), new Set(SERVICE_IDS));
+
+  for (const [toolName, actionId] of Object.entries(PROMOTED_ACTION_IDS)) {
+    if (!registry.byId.has(actionId)) {
+      problems.push(`${toolName} has no backing action \`${actionId}\``);
+    }
+  }
+  if (registry.actions.length === 0) problems.push('action registry is empty');
+
+  const report = {
+    ok: problems.length === 0,
+    version: '0.1.0',
+    node: process.version,
+    platform: `${process.platform}/${process.arch}`,
+    actions: registry.actions.length,
+    tools: tools.length,
+    specs: Object.fromEntries(
+      Object.entries(registry.stats).map(([service, s]) => [service, s.version]),
+    ),
+    problems,
+  };
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  return problems.length === 0 ? 0 : 1;
+}
+
 async function main(): Promise<void> {
+  if (process.argv.includes('--selftest')) {
+    process.exit(selfTest());
+  }
+
   const manifest = JSON.parse(
     readFileSync(join(REPO_ROOT, 'specs', 'manifest.json'), 'utf8'),
   ) as SpecManifest;

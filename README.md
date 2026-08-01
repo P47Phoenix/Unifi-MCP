@@ -74,6 +74,58 @@ claude mcp add unifi -- node /absolute/path/to/Unifi-MCP/dist/index.js
 An MCPB bundle — one file, no Node prerequisite — is the planned distribution format
 (milestone M5 in the PRD). Until then this is the supported path.
 
+## Container image
+
+Published to GHCR on every push to `main`, built natively for **linux/arm64** and
+**linux/amd64**:
+
+```bash
+docker run -i --rm \
+  -e UNIFI_API_KEY=your-key \
+  ghcr.io/p47phoenix/unifi-mcp:latest
+```
+
+As an MCP client entry:
+
+```bash
+claude mcp add unifi -- docker run -i --rm -e UNIFI_API_KEY=your-key ghcr.io/p47phoenix/unifi-mcp:latest
+```
+
+Verify any image without credentials:
+
+```bash
+docker run --rm ghcr.io/p47phoenix/unifi-mcp:latest --selftest
+```
+
+`--selftest` checks the *artifact* — that the vendored specs are present, the action
+registry builds, and every promoted tool resolves to a backing action. It exits 0 on a
+correct image with no API key configured, and non-zero on a broken one. That split is
+deliberate: a probe that failed on a missing credential would report a broken image when
+the real problem is a missing secret.
+
+### Deploying this
+
+**This server speaks MCP over stdio. It does not listen on a port.** There is nothing to
+curl, no HTTP readiness probe target, and no `EXPOSE` in the image. The `-i` in the
+commands above is load-bearing — without an attached stdin the process has no transport
+and exits immediately.
+
+That matters if you are handing the image to a platform team: deployed as an ordinary
+long-running workload, it will look like a crash-loop. That is the deployment shape being
+wrong, not the image. The supported pattern is for the **MCP client to spawn the
+container** per session (`docker run -i --rm ...`), the same way it would spawn a local
+process.
+
+If you need it to run as a persistent, network-reachable service — a Deployment behind a
+Service, several clients sharing one instance — that requires a streamable-HTTP transport,
+which this server does not currently implement. See ADR-01 and open question OQ-09 in
+[`docs/prd.md`](docs/prd.md); shipping it is a decision, not an oversight.
+
+The image runs as the unprivileged `node` user (uid 1000), writes nothing to disk, and
+needs no writable volume. Credentials arrive as environment variables — the OS keychain
+path is skipped in containers, and `keytar` is deliberately excluded from the image, since
+a native binding to a keychain daemon that does not exist could only fail at runtime.
+
 ## Getting an API key
 
 Create a key at [unifi.ui.com](https://unifi.ui.com) → **Settings → API Keys**, or on the
@@ -218,4 +270,9 @@ Two quirks worth knowing if you read the specs yourself:
 
 ## License
 
-MIT
+[MIT](LICENSE) — covers the code in this repository.
+
+The OpenAPI documents under `specs/` are Ubiquiti's, vendored verbatim from
+`developer.ui.com` and redistributed here so the server can start without network access.
+They are not covered by the MIT grant above and remain subject to whatever terms Ubiquiti
+applies to them. This project is not affiliated with or endorsed by Ubiquiti Inc.
