@@ -1,0 +1,17 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "orphan schema — $ref'd by no operation in this spec version",
+    "pointer": "#/components/schemas/Error Message",
+    "note": "Hand-derived. The schema documents requestId as the field to quote to support on a 500 specifically, so this is the case where correlationId carrying through matters most."
+  },
+  "body": {
+    "code": "api.internal.unexpected-error",
+    "message": "Internal server error",
+    "requestId": "3fa85f64-5717-4562-b3fc-2c963f66afaa",
+    "requestPath": "/integration/v1/sites/123/devices",
+    "statusCode": 500,
+    "statusName": "INTERNAL_SERVER_ERROR",
+    "timestamp": "2024-11-27T08:17:33.777Z"
+  }
+}

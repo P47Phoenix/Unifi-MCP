@@ -1,0 +1,12 @@
+{
+  "$provenance": {
+    "spec": "specs/protect/v7.1.87/openapi.json",
+    "operation": "default response of GET /v1/cameras",
+    "pointer": "#/components/schemas/genericError",
+    "note": "Required shape. Protect has no per-app scope vocabulary, so unlike Mobility the hint here is the generic forbidden one."
+  },
+  "body": {
+    "error": "API key does not have permission to access cameras",
+    "name": "FORBIDDEN"
+  }
+}

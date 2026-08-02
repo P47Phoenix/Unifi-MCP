@@ -1,0 +1,17 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "orphan schema — $ref'd by no operation in this spec version",
+    "pointer": "#/components/schemas/Error Message",
+    "note": "Hand-derived. `api.authorization.` maps to forbidden by prefix; the full dotted code is an open namespace and must pass through verbatim."
+  },
+  "body": {
+    "code": "api.authorization.insufficient-permissions",
+    "message": "API key lacks permission for this site",
+    "requestId": "3fa85f64-5717-4562-b3fc-2c963f66afa7",
+    "requestPath": "/integration/v1/sites/123/devices",
+    "statusCode": 403,
+    "statusName": "FORBIDDEN",
+    "timestamp": "2024-11-27T08:14:02.114Z"
+  }
+}

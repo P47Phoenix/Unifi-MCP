@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "getHostById (GET /v1/hosts/{id})",
+    "pointer": "#/paths/~1v1~1hosts~1{id}/get/responses/400/content/application~1json/schema",
+    "note": "Spec-authentic. `parameter_invalid` is lowercase, so SITE_MANAGER_CATEGORIES (keyed UPPERCASE) misses it and the status map supplies bad_request. upstreamCode must survive verbatim."
+  },
+  "body": {
+    "code": "parameter_invalid",
+    "httpStatusCode": 400,
+    "message": "invalid time format: 2024-04-24",
+    "traceId": "a7dc15e0eb4527142d7823515b15f87d"
+  }
+}

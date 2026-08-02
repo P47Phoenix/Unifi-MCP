@@ -1,0 +1,32 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "getConnectedClientOverviewPage (GET /v1/sites/{siteId}/clients)",
+    "pointer": "#/components/schemas/Client overview page",
+    "note": "Terminal page of the offset/limit chain: offset 3 + 2 returned reaches totalCount 5, so hasMore is false and nextCursor must be null. Includes a VPN client, whose subtype carries neither macAddress nor uplinkDeviceId."
+  },
+  "body": {
+    "count": 2,
+    "limit": 3,
+    "offset": 3,
+    "totalCount": 5,
+    "data": [
+      {
+        "id": "3fa85f64-5717-4562-b3fc-2c963f66afa9",
+        "name": "remote-engineer",
+        "type": "VPN",
+        "access": { "type": "DEFAULT" },
+        "ipAddress": "192.168.9.4",
+        "connectedAt": "2026-08-01T06:30:44.118Z"
+      },
+      {
+        "id": "3fa85f64-5717-4562-b3fc-2c963f66afaa",
+        "name": "teleport-phone",
+        "type": "TELEPORT",
+        "access": { "type": "DEFAULT" },
+        "ipAddress": "192.168.9.5",
+        "connectedAt": "2026-08-01T06:33:01.907Z"
+      }
+    ]
+  }
+}

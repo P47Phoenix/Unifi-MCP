@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "getHostById (GET /v1/hosts/{id})",
+    "pointer": "#/paths/~1v1~1hosts~1{id}/get/responses/408/content/application~1json/schema",
+    "note": "Spec-authentic. `DeviceTimeout` is PascalCase — a third casing convention in the same spec — and maps to timeout purely from HTTP 408."
+  },
+  "body": {
+    "code": "DeviceTimeout",
+    "httpStatusCode": 408,
+    "message": "Device connection timeout",
+    "traceId": "a7dc15e0eb4527142d7823515b15f87d"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/ErrorResponse",
+    "note": "The `bad_request` enum member exists in ErrorResponse but no example in the spec ever emits it. Authored so the declared vocabulary is covered even though the observed vocabulary does not reach it."
+  },
+  "body": {
+    "code": "bad_request",
+    "httpStatusCode": 400,
+    "message": "workspaceID is not a valid uuid",
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c"
+  }
+}

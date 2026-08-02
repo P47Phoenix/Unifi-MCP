@@ -68,9 +68,10 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      # R-7: the build skill ships no test scaffolding, so the harness is an M2
-      # deliverable that does not exist yet. The step runs unconditionally and
-      # says so out loud rather than being silently absent from the workflow —
+      # R-7: the build skill ships no test scaffolding, so the harness is this
+      # repo's own — scripts/run-tests.mjs over test/*.test.ts, run via `npm
+      # test`. It sits second because unit and contract failures are the
+      # cheapest signal to read after a typecheck error.
       - name: Test
         run: npm test
 
@@ -107,16 +108,13 @@ jobs:
         run: npm run build
 
       # FR-60: MCP Inspector in --cli mode is the smoke test; no bespoke MCP
-      # harness is invented. src/index.ts does not exist yet, so the step guards
-      # on the built entrypoint and goes live automatically when it lands.
+      # harness is invented. It exercises dist/index.js — the same artifact the
+      # container declares as its ENTRYPOINT — and is deliberately unguarded:
+      # the Build step above runs unconditionally, so any existence check here
+      # could only turn a broken build into a green skip.
       - name: MCP Inspector CLI smoke test
         shell: bash
         run: |
-          if [ ! -f dist/index.js ]; then
-            echo "::notice title=Entrypoint not built::dist/index.js does not exist yet (src/index.ts lands at M3). Skipping the Inspector smoke test (FR-60)."
-            exit 0
-          fi
-
           echo "Running MCP Inspector ${INSPECTOR_VERSION} --cli against dist/index.js"
 
           # Placeholder credentials, deliberately. NFR-17 requires the server to

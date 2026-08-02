@@ -15,7 +15,8 @@ import { normalizePage, clampPageSize, pageQueryParams } from '../http/paginatio
 import { renderUntrustedBlock } from '../safety/sanitize.js';
 import { applyPayloadCeiling, projectFields, projectionFor } from '../safety/truncate.js';
 import { NEVER_SHIP } from '../registry/blocklist.js';
-import { expandQuery, searchActions } from './search.js';
+import type { WithheldMatch } from './search.js';
+import { searchActions, searchBlocklist } from './search.js';
 
 export interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -66,6 +67,69 @@ function errorResult(e: unknown): ToolResult {
       'This is an internal error in the UniFi MCP server rather than an API failure. Retrying the same call is unlikely to help.',
     ),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Explaining what is withheld (FR-46)
+// ---------------------------------------------------------------------------
+
+/**
+ * The one sentence this server says about a withheld operation.
+ *
+ * Every surface that mentions the blocklist routes through here — the
+ * empty-result branch of search, the results-present branch, and the
+ * unknown-action-id error. One composer is the only way the same fact stops
+ * being told two different ways depending on whether other results happened to
+ * match, and it is also what makes the explanation identical over stdio and
+ * over HTTP (FR-74): there is no second string to drift.
+ *
+ * The wording differs by disposition because the facts differ. A whole-operation
+ * block is absent from the registry in every configuration; a variant
+ * withholding leaves the operation reachable and refuses one named
+ * discriminator. Describing the second as "not exposed" would be false, and
+ * would send a caller looking for a workaround to an endpoint they can already
+ * reach.
+ *
+ * What it deliberately does not say: any action ID, any execute-tool name, any
+ * parameter schema, any alternative route. Naming the operation and the reason
+ * is the whole of what FR-46 promises.
+ */
+function describeWithheldOperation(match: WithheldMatch): string {
+  const operation = `${match.method} ${match.path} (${match.service})`;
+  const reason = match.reasons.join(' ');
+  if (match.disposition === 'variant-withheld') {
+    const variants = match.variants.join(' and ');
+    const verb = match.variants.length === 1 ? 'variant is' : 'variants are';
+    return `${operation} remains reachable, but its ${variants} ${verb} deliberately withheld — ${reason}`;
+  }
+  return `${operation} is deliberately not exposed by this server, in any configuration — ${reason}`;
+}
+
+/** The withheld footnote for a search result, or '' when nothing was withheld. */
+export function explainWithheld(matches: readonly WithheldMatch[]): string {
+  if (matches.length === 0) return '';
+  return [
+    'Not everything matching this query is exposed:',
+    ...matches.map((match) => `- ${describeWithheldOperation(match)}`),
+  ].join('\n');
+}
+
+/**
+ * Structured form of the withheld set.
+ *
+ * Kept under its own key rather than merged into `matches`: that array is the
+ * invocable set, and a withheld operation appearing in it would read as
+ * something to call.
+ */
+function withheldContent(matches: readonly WithheldMatch[]): Array<Record<string, unknown>> {
+  return matches.map((match) => ({
+    service: match.service,
+    method: match.method,
+    path: match.path,
+    disposition: match.disposition,
+    variants: match.variants,
+    reason: match.reasons.join(' '),
+  }));
 }
 
 /** Render a normalized page as text + structured content. */
@@ -212,32 +276,26 @@ export function createHandlers(ctx: HandlerContext) {
     const service = args.service as ServiceId | undefined;
     const actionClass = args.action_class as 'read' | 'write' | undefined;
 
-    const terms = expandQuery(query);
     const scored = searchActions(ctx.actions, query, { service, actionClass, limit });
 
     // FR-46: a query that matches something deliberately withheld gets told so.
-    // Silence would read as "this API cannot do that", which is false.
-    const withheld = NEVER_SHIP.filter((entry) =>
-      terms.some(
-        (term) => entry.path.toLowerCase().includes(term) || (entry.discriminator ?? '').toLowerCase().includes(term),
-      ),
-    );
+    // Silence would read as "this API cannot do that", which is false. The
+    // withheld set is ranked by the same expansion and weighting as `scored`,
+    // so ordinary phrasing that finds an action also finds what was withheld.
+    const withheld = searchBlocklist(NEVER_SHIP, query, { service });
+    const explanation = explainWithheld(withheld);
 
     if (scored.length === 0) {
       const enabled = [...ctx.config.enabledServices].join(', ') || 'none';
-      const note = withheld.length
-        ? ` Some matching operations are deliberately not exposed by this server: ${withheld
-            .map((w) => `${w.method} ${w.path}${w.discriminator ? ` (${w.discriminator})` : ''} — ${w.reason}`)
-            .join('; ')}`
-        : '';
+      const lines = [`No actions matched "${args.query}". Enabled services: ${enabled}.`];
+      if (explanation) lines.push(explanation);
       return {
-        content: [
-          {
-            type: 'text',
-            text: `No actions matched "${args.query}". Enabled services: ${enabled}.${note}`,
-          },
-        ],
-        structuredContent: { matches: [], enabled_services: [...ctx.config.enabledServices] },
+        content: [{ type: 'text', text: lines.join('\n\n') }],
+        structuredContent: {
+          matches: [],
+          withheld: withheldContent(withheld),
+          enabled_services: [...ctx.config.enabledServices],
+        },
       };
     }
 
@@ -261,17 +319,14 @@ export function createHandlers(ctx: HandlerContext) {
     }));
 
     const lines = [`${matches.length} matching action${matches.length === 1 ? '' : 's'}:`];
-    if (withheld.length) {
-      lines.push(
-        `Deliberately not exposed: ${withheld
-          .map((w) => `${w.method} ${w.path}${w.discriminator ? ` (${w.discriminator})` : ''}`)
-          .join('; ')}.`,
-      );
-    }
+    if (explanation) lines.push(explanation);
     lines.push(JSON.stringify(matches, null, 2));
     const { text } = applyPayloadCeiling(lines.join('\n\n'));
 
-    return { content: [{ type: 'text', text }], structuredContent: { matches } };
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: { matches, withheld: withheldContent(withheld) },
+    };
   };
 
   const makeExecutor = (expected: 'read' | 'write', siblingTool: string) =>
@@ -280,14 +335,20 @@ export function createHandlers(ctx: HandlerContext) {
         const actionId = String(args.action_id ?? '');
         const action = ctx.byId.get(actionId);
         if (!action) {
-          const blocked = NEVER_SHIP.find((b) => actionId.includes(b.path.split('/').pop() ?? ' '));
+          // The same ranked matcher search uses, fed the action id as the
+          // query: `expandConcepts` already splits on the dots and underscores
+          // an id is built from, so `network.restart_device` expands exactly
+          // as "restart device" would.
+          const [nearest] = searchBlocklist(NEVER_SHIP, actionId, { limit: 1 });
           return errorResult(
             new UnifiError(
               localError(
                 'site-manager',
                 'not_found',
                 `No action with id \`${actionId}\`.${
-                  blocked ? ' A similar operation is deliberately not exposed by this server.' : ''
+                  nearest
+                    ? ` A similar operation is covered by this server's never-ship blocklist: ${describeWithheldOperation(nearest)}`
+                    : ''
                 }`,
                 'Use unifi_search_actions to get a valid action id.',
               ),

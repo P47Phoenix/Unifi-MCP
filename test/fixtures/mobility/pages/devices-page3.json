@@ -1,0 +1,18 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/DeviceListResponse",
+    "note": "Page 3 of 3 and the terminal page: offset 6 + 1 returned equals total 7, which is exactly the FR-23 stop condition, so nextCursor must be null and truncation must be null."
+  },
+  "body": {
+    "total": 7,
+    "offset": 6,
+    "limit": 3,
+    "httpStatusCode": 200,
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c",
+    "data": [
+      { "id": "bb6fea66-48f1-a7da-0d7c-aaccbbaa6666", "name": "Yard Router", "model": "UMR Ultra", "state": "GETTING_READY", "firmware_version": "3.1.14", "mac_address": "00:1A:2B:3C:4D:62" }
+    ]
+  }
+}

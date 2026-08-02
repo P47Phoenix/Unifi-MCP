@@ -4,16 +4,26 @@
 #
 # ## What this image is
 #
-# A **stdio** MCP server (ADR-01 in docs/prd.md). It speaks MCP over stdin and
-# stdout and does NOT listen on a port. There is nothing to curl and nothing for
-# an HTTP readiness probe to hit. Run it interactively:
+# An MCP server (ADR-01 in docs/prd.md) that speaks one of two transports. The
+# transport is chosen by configuration — the `UNIFI_MCP_TRANSPORT` environment
+# variable — and never by the arguments you pass on the command line.
+#
+# The default is **stdio**: MCP over stdin and stdout, which is what you get if
+# you set nothing. Run it interactively:
 #
 #     docker run -i --rm -e UNIFI_API_KEY=... ghcr.io/p47phoenix/unifi-mcp:latest
 #
-# The `-i` is load-bearing: without an attached stdin the process has no
-# transport and exits. A platform expecting a long-running listener will report
-# this image as crash-looping, which is a symptom of the deployment shape, not
-# of the image. See "Deploying this" in README.md.
+# The `-i` is load-bearing for that shape: without an attached stdin the process
+# has no transport and exits. A platform expecting a long-running listener will
+# report the stdio shape as crash-looping, which is a symptom of the deployment
+# shape, not of the image. See "Deploying this" in README.md.
+#
+# Set `UNIFI_MCP_TRANSPORT=http` and the process serves MCP over
+# streamable-HTTP instead, binding `UNIFI_HTTP_BIND`:`UNIFI_HTTP_PORT`. The
+# default bind is loopback, which is unreachable from outside the container's
+# network namespace — so a container deployment wants `UNIFI_HTTP_BIND=0.0.0.0`
+# or nothing outside will ever reach it. `/healthz` and `/readyz` are the
+# endpoints to point liveness and readiness probes at.
 #
 # Use `--selftest` for a credential-free artifact check that exits 0/1.
 #
@@ -59,7 +69,7 @@ FROM node:${NODE_VERSION}-bookworm-slim AS runtime
 
 # OCI labels; the workflow overwrites source/revision/created at build time.
 LABEL org.opencontainers.image.title="unifi-mcp" \
-      org.opencontainers.image.description="MCP server over the four published Ubiquiti UniFi developer APIs (Site Manager, Network, Protect, Mobility). Speaks MCP over stdio; does not listen on a port." \
+      org.opencontainers.image.description="MCP server over the four published Ubiquiti UniFi developer APIs (Site Manager, Network, Protect, Mobility). Speaks MCP over stdio by default, or streamable-HTTP when UNIFI_MCP_TRANSPORT=http." \
       org.opencontainers.image.source="https://github.com/P47Phoenix/Unifi-MCP" \
       org.opencontainers.image.licenses="MIT"
 
@@ -80,8 +90,12 @@ COPY --from=builder /build/specs ./specs
 # filesystem (FR-15), so the whole tree can stay read-only.
 USER node
 
-# No port is exposed on purpose. Adding EXPOSE would imply a listener that does
-# not exist and would mislead whoever deploys this.
+# EXPOSE is inert metadata and nothing more: it declares the port this image
+# would use, it does not bind anything and it does not publish anything. The
+# listener is opt-in — you get it only by setting `UNIFI_MCP_TRANSPORT=http`.
+# The default is still stdio, and under stdio nothing ever binds this port.
+# 8787 is here because it is the default value of `UNIFI_HTTP_PORT`.
+EXPOSE 8787
 
 # Checks the artifact, not the configuration: an image missing its specs/ layer
 # fails, a correct image with no API key configured passes. The distinction

@@ -1,0 +1,9 @@
+{
+  "$provenance": {
+    "spec": "specs/protect/v7.1.87/openapi.json",
+    "operation": "GET /v1/cameras",
+    "pointer": "#/paths/~1v1~1cameras/get/responses/200/content/application~1json/schema",
+    "note": "The degenerate Protect page: a console with no adopted cameras returns an empty bare array, not an envelope with an empty data key. normalizePage must still return totalCount 0, returnedCount 0, nextCursor null and paginationEmulated true rather than treating the empty array as an unparseable body."
+  },
+  "body": []
+}

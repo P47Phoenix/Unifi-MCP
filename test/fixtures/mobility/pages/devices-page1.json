@@ -1,0 +1,20 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/DeviceListResponse",
+    "note": "Page 1 of 3 in a chain of total 7 split 3/3/1. offset 0 + 3 returned is short of total 7, so nextCursor carries offset 3. DeviceSummary uses snake_case field names, unlike the other three APIs."
+  },
+  "body": {
+    "total": 7,
+    "offset": 0,
+    "limit": 3,
+    "httpStatusCode": 200,
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c",
+    "data": [
+      { "id": "550e8400-e29b-41d4-a716-446655440000", "name": "Office Router", "model": "UMR", "state": "CONNECTED", "firmware_version": "3.1.14", "mac_address": "00:1A:2B:3C:4D:5E" },
+      { "id": "661f9511-f3ac-52e5-b827-557766551111", "name": "Branch Router", "model": "UMR Ultra", "state": "DISCONNECTED", "firmware_version": "3.1.12", "mac_address": "AA:BB:CC:DD:EE:FF" },
+      { "id": "772fa622-04bd-63f6-c938-668877662222", "name": "Depot Router", "model": "UMR Industrial", "state": "UPGRADING", "firmware_version": "3.1.14", "mac_address": "00:1A:2B:3C:4D:5F" }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "orphan schema — $ref'd by no operation in this spec version",
+    "pointer": "#/components/schemas/Error Message",
+    "note": "Hand-derived. `api.rate-limit` is matched as a bare prefix, not a dotted one, so a code with no further segment must still classify."
+  },
+  "body": {
+    "code": "api.rate-limit.exceeded",
+    "message": "Too many requests",
+    "requestId": "3fa85f64-5717-4562-b3fc-2c963f66afa9",
+    "requestPath": "/integration/v1/sites/123/clients",
+    "statusCode": 429,
+    "statusName": "TOO_MANY_REQUESTS",
+    "timestamp": "2024-11-27T08:16:00.001Z"
+  }
+}

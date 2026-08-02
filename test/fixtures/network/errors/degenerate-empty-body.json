@@ -1,0 +1,9 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "orphan schema — $ref'd by no operation in this spec version",
+    "pointer": "#/components/schemas/Error Message",
+    "note": "Degenerate: nothing at all. Reproduces the real gap this spec leaves — no operation declares any 4xx or 5xx response, so an unstructured failure body is entirely plausible in practice."
+  },
+  "body": {}
+}

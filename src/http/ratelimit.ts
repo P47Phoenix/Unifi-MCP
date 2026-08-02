@@ -38,18 +38,62 @@ export interface RateLimiterOptions {
 
 const DEFAULT_MAX_WAIT_MS = 30_000;
 
+/**
+ * `retryAfterSeconds` for a waiter abandoned before it ever computed a wait.
+ * Derived from the existing queue ceiling rather than picked, so the hint a
+ * caller sees at shutdown matches the longest wait the limiter would have
+ * imposed anyway.
+ */
+const SHUTDOWN_RETRY_AFTER_SECONDS = Math.ceil(DEFAULT_MAX_WAIT_MS / 1000);
+
 export class RateLimiter {
   private readonly buckets = new Map<string, Bucket>();
   private readonly limits: Map<string, BucketLimit>;
   private readonly defaultLimit: BucketLimit;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
+  /** Handles of in-flight default sleeps, so `close()` can release them. */
+  private readonly pendingTimers = new Set<NodeJS.Timeout>();
+  private readonly abort = new AbortController();
+  private closed = false;
 
   constructor(options: RateLimiterOptions = {}) {
     this.limits = new Map(Object.entries(options.limits ?? {}));
     this.defaultLimit = options.defaultLimit ?? { requestsPerMinute: 100 };
     this.now = options.now ?? (() => Date.now());
-    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.sleep = options.sleep ?? ((ms) => this.trackedSleep(ms));
+  }
+
+  /** Test and observation seam; the limiter is never reopened. */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /**
+   * Stop admitting, release every parked waiter, drop every timer (FR-70, NFR-27).
+   *
+   * Idempotent, synchronous and never throwing: a graceful drain must not be
+   * able to block on the thing it is draining. Abandonment is a signal, not an
+   * await — a waiter parked in `sleep` is otherwise invisible and unwakeable
+   * for up to the full queue ceiling past the shutdown signal.
+   */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+
+    // Released, not merely un-awaited: a pending timer keeps the event loop
+    // alive on its own, so abandoning the await without clearing the handle
+    // still holds the process open to the hard stop on every clean shutdown.
+    for (const handle of this.pendingTimers) clearTimeout(handle);
+    this.pendingTimers.clear();
+
+    // No acquisition can follow, so the bucket state is dead weight.
+    this.buckets.clear();
+
+    // Last, so the waiters this wakes observe a fully drained limiter. The
+    // reason is a fallback for anything reading `signal.reason`; each waiter
+    // builds its own bucket-specific error at rejection time.
+    this.abort.abort(this.shutdownError('shutdown', SHUTDOWN_RETRY_AFTER_SECONDS));
   }
 
   /** Limits may be set after construction; buckets pick the change up in place. */
@@ -70,6 +114,10 @@ export class RateLimiter {
    * never silently sent anyway.
    */
   async acquire(bucketKey: string): Promise<void> {
+    // First statement, before any bucket exists: a waiter that arrives after
+    // the drain is never added to a tail chain.
+    if (this.closed) throw this.shutdownError(bucketKey, SHUTDOWN_RETRY_AFTER_SECONDS);
+
     const bucket = this.bucketFor(bucketKey);
 
     // Chaining onto `tail` makes the wait computation exact: each waiter sees
@@ -84,6 +132,10 @@ export class RateLimiter {
   }
 
   private async consume(bucketKey: string, bucket: Bucket): Promise<void> {
+    // First statement, before any accounting: this covers the waiter that was
+    // chained before `close()` and whose predecessor settles after it.
+    if (this.closed) throw this.shutdownError(bucketKey, SHUTDOWN_RETRY_AFTER_SECONDS);
+
     this.refill(bucket);
     if (bucket.tokens >= 1) {
       bucket.tokens -= 1;
@@ -115,7 +167,7 @@ export class RateLimiter {
       });
     }
 
-    await this.sleep(waitMs);
+    await this.waitOrAbandon(waitMs, bucketKey);
     this.refill(bucket);
     bucket.tokens = Math.max(0, bucket.tokens - 1);
   }
@@ -141,6 +193,89 @@ export class RateLimiter {
       this.buckets.set(bucketKey, bucket);
     }
     return bucket;
+  }
+
+  /**
+   * Wait for the next slot, unless the limiter is drained first.
+   *
+   * Abandonment is signalled by an `AbortController`, never by a long-lived
+   * promise that is rejected at drain and raced with `Promise.race`. `race`
+   * attaches a handler to that promise only while a wait is actually in
+   * progress, so on the overwhelmingly common shutdown — nothing in flight —
+   * the rejection would land with no handler attached and Node's default
+   * `--unhandled-rejections=throw` would terminate the process on the next
+   * tick. An `AbortSignal` carries no notion of an unhandled anything, and the
+   * rejection below is built inside a continuation that always has a consumer.
+   *
+   * The listener is removed on either settlement path, so an idle process
+   * accumulates nothing.
+   */
+  private waitOrAbandon(waitMs: number, bucketKey: string): Promise<void> {
+    const signal = this.abort.signal;
+    // The seconds this waiter had already computed for its own wait, carried
+    // through unchanged rather than recomputed or nulled.
+    const seconds = Math.ceil(waitMs / 1000);
+    if (signal.aborted) return Promise.reject(this.shutdownError(bucketKey, seconds));
+
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => reject(this.shutdownError(bucketKey, seconds));
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      const settled = (): void => signal.removeEventListener('abort', onAbort);
+
+      // When `close()` clears a pending default-sleep timer, that sleep's own
+      // promise never resolves. Safe precisely because `onAbort` has already
+      // rejected the promise returned here, so the awaiting caller is settled
+      // either way — an awaiting caller is never left with a promise that
+      // never settles.
+      this.sleep(waitMs).then(
+        () => {
+          settled();
+          resolve();
+        },
+        (error: unknown) => {
+          settled();
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /**
+   * The default sleep, with its handle captured so `close()` can release it.
+   *
+   * The timer is deliberately NOT `unref()`'d: an unreferenced timer would let
+   * the process exit while a legitimate in-flight tool call is still queued,
+   * which is reachable on a short stdio session. Clearing the handle on
+   * `close()` reaches the shutdown goal without that failure mode.
+   */
+  private trackedSleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const handle = setTimeout(() => {
+        this.pendingTimers.delete(handle);
+        resolve();
+      }, ms);
+      this.pendingTimers.add(handle);
+    });
+  }
+
+  /** The drain rejection: the existing `rate_limit` contract, naming shutdown. */
+  private shutdownError(bucketKey: string, retryAfterSeconds: number): UnifiError {
+    return new UnifiError({
+      category: 'rate_limit',
+      service: serviceFromBucketKey(bucketKey),
+      httpStatus: null,
+      upstreamCode: null,
+      message:
+        `The client-side rate limiter for \`${bucketKey}\` was closed during shutdown, so the ` +
+        `queued request was released instead of being sent. Nothing was rejected upstream.`,
+      correlationId: null,
+      origin: null,
+      recoveryHint:
+        `This server instance is shutting down and admits no further requests. Retry in ` +
+        `${retryAfterSeconds}s against a newly started instance.`,
+      retryAfterSeconds,
+    });
   }
 }
 

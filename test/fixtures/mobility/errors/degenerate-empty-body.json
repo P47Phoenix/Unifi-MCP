@@ -1,0 +1,9 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/ErrorResponse",
+    "note": "Degenerate: no code, so origin is upstream by the same rule, and no message, so the fallback sentence applies. Shows the two null-ish paths do not interfere."
+  },
+  "body": {}
+}

@@ -12,6 +12,14 @@
  * runner only auto-discovers `.js`, and glob support for positional arguments
  * landed in Node 21. So discovery happens here, where it behaves identically
  * everywhere and a new test file is picked up without editing package.json.
+ *
+ * `--test-timeout` is here because `node:test` defaults to `Infinity` and
+ * `spawnSync` blocks: a test awaiting a promise that never settles would hang
+ * the CI job to GitHub's 360-minute ceiling instead of failing it. 60 000 ms is
+ * the longest legitimate case — a shutdown-deadline assertion at roughly 36 s —
+ * plus headroom for a slow shared runner. On timeout `node:test` fails and
+ * names the offending test, the child exits non-zero, and the `process.exit`
+ * below propagates that.
  */
 import { spawnSync } from 'node:child_process';
 import { readdirSync } from 'node:fs';
@@ -31,9 +39,10 @@ if (files.length === 0) {
   process.exit(1);
 }
 
-const result = spawnSync(process.execPath, ['--test', '--import', 'tsx', ...files], {
-  stdio: 'inherit',
-  cwd: repoRoot,
-});
+const result = spawnSync(
+  process.execPath,
+  ['--test', '--test-timeout=60000', '--import', 'tsx', ...files],
+  { stdio: 'inherit', cwd: repoRoot },
+);
 
 process.exit(result.status ?? 1);

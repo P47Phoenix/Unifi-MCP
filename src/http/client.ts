@@ -71,6 +71,19 @@ const RETRYABLE_NETWORK_CODES = new Set([
 /** Socket failures worth retrying, identified when the error is constructed. */
 const TRANSIENT_ERRORS = new WeakSet<UnifiError>();
 
+/**
+ * `retryAfterSeconds` for an action abandoned before it computed a wait of its
+ * own (FR-70 step 3, NFR-27).
+ *
+ * The figure is the rate limiter's queue ceiling — `DEFAULT_MAX_WAIT_MS` in
+ * src/http/ratelimit.ts, 30 000 ms — so the hint a caller sees at shutdown
+ * matches the longest wait the limiter would have imposed anyway. That constant
+ * is module-private there and is deliberately not exported to satisfy this
+ * file: widening `ratelimit.ts`'s surface for a hint value would be a worse
+ * trade than restating the derived figure with its source named here.
+ */
+const SHUTDOWN_RETRY_AFTER_SECONDS = 30;
+
 interface RawResponse {
   status: number;
   headers: Headers;
@@ -83,6 +96,14 @@ export class UnifiClient {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly agents = new Map<string, Agent>();
   private caBundle: Buffer | null = null;
+  /** Handles of in-flight default backoff sleeps, so `close()` can release them. */
+  private readonly pendingTimers = new Set<NodeJS.Timeout>();
+  /** The controller behind each in-flight attempt; the only handle on one. */
+  private readonly inFlight = new Set<AbortController>();
+  /** Signals abandonment of a backoff or a credential resolution, never of an attempt. */
+  private readonly drainAbort = new AbortController();
+  private draining = false;
+  private closed = false;
 
   constructor(
     private readonly config: ServerConfig,
@@ -91,7 +112,7 @@ export class UnifiClient {
   ) {
     this.limiter = options.limiter ?? createRateLimiter(config);
     this.warn = options.warn ?? ((m) => process.stderr.write(`${m}\n`));
-    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.sleep = options.sleep ?? ((ms) => this.trackedSleep(ms));
 
     if (config.caBundlePath) {
       try {
@@ -122,6 +143,84 @@ export class UnifiClient {
     }
   }
 
+  /** Test and observation seam; a drained client is never reopened. */
+  get isDraining(): boolean {
+    return this.draining;
+  }
+
+  /**
+   * Stop admitting, abandon every wait, leave in-flight attempts alone (FR-70
+   * step 3, NFR-27).
+   *
+   * Idempotent, synchronous and never throwing: a graceful drain must not be
+   * able to block on the thing it is draining. In-flight HTTP attempts are
+   * deliberately untouched — FR-70 step 4 requires the tool handlers already
+   * running to finish under the existing per-attempt deadline, and aborting
+   * here would truncate the very requests the drain promises to complete.
+   */
+  beginDrain(): void {
+    if (this.draining) return;
+    this.draining = true;
+
+    // The only propagation path that can exist: `limiter` is private with no
+    // accessor, so nothing outside this class can reach it. `RateLimiter.close`
+    // is itself idempotent, synchronous and non-throwing (US-08), which is what
+    // lets this method promise the same.
+    this.limiter.close();
+
+    // Last, so anything this wakes observes a fully drained client. The reason
+    // is a fallback for anything reading `signal.reason`; each abandoned wait
+    // builds its own service-specific error at rejection time.
+    this.drainAbort.abort(
+      this.shutdownError('site-manager', SHUTDOWN_RETRY_AFTER_SECONDS),
+    );
+  }
+
+  /**
+   * Drain, then release everything that holds the event loop open (FR-70 steps
+   * 3, 4 and 7).
+   *
+   * Idempotent and never rejecting. Until this exists there is no call to
+   * `agent.destroy()` anywhere in `src/`, and a pooled keep-alive socket is a
+   * `ref`'d handle — so "the process exits 0 by natural event-loop drain" is
+   * unreachable no matter how cleanly the inbound side shuts down.
+   */
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.beginDrain();
+
+    // Before the agents, not after: destroying an agent first would surface as
+    // ECONNRESET, which is in RETRYABLE_NETWORK_CODES and would earn the
+    // request another attempt on the way out. Aborting produces the AbortError
+    // that `transportError` maps to the shutdown error, which is terminal.
+    for (const controller of this.inFlight) controller.abort();
+    this.inFlight.clear();
+
+    // Released, not merely un-awaited: a pending timer keeps the event loop
+    // alive on its own, so abandoning the await without clearing the handle
+    // still holds the process open to the hard stop on every clean shutdown.
+    for (const handle of this.pendingTimers) clearTimeout(handle);
+    this.pendingTimers.clear();
+
+    for (const agent of this.agents.values()) {
+      try {
+        agent.destroy();
+      } catch (e: unknown) {
+        // Reported rather than swallowed, and swallowed rather than thrown:
+        // one uncooperative agent must not abort the disposal of the rest, and
+        // `close()` is called on the shutdown path where a rejection has no
+        // handler that could do anything useful with it.
+        this.warn(
+          `unifi-mcp: an outbound agent failed to close during shutdown ` +
+            `(${e instanceof Error ? e.message : String(e)}); its sockets may be released only ` +
+            `when the process exits.`,
+        );
+      }
+    }
+    this.agents.clear();
+  }
+
   async request(action: Action, args: Record<string, unknown> = {}): Promise<UnifiResponse> {
     // FR-44: the interceptor point. Writes are unreachable unless the operator
     // named the service in UNIFI_ENABLE_WRITES — no argument reaches this
@@ -140,12 +239,29 @@ export class UnifiClient {
       );
     }
 
+    // FR-70 step 3: nothing new is admitted once the drain begins.
+    //
+    // Deliberately AFTER the write gate above and before target resolution or
+    // URL construction. Placing it first would make a write-gated action during
+    // drain return `rate_limit` instead of its FR-44 `config` refusal — moving
+    // an enforcement point, which is exactly what this file's budget forbids.
+    // The gate keeps its precedence; the drain only decides what happens to
+    // work the gate already let through.
+    if (this.draining) throw this.shutdownError(action.service, SHUTDOWN_RETRY_AFTER_SECONDS);
+
     const host = this.hostOverride(action, args);
     const target = resolveTarget(this.config, action.service, host);
     const { pathParams, query, headerParams, body } = splitArgs(action, args);
     const url = buildUrl(this.config, action, pathParams, query, host);
 
-    const apiKey = await this.credentials.resolveFor(action.service, target.mode, target.host);
+    // The call, its arguments and its result are unchanged; the wrapper adds
+    // only the drain-abandonment path (FR-70 step 3). An action parked here
+    // holds no rate-limit token and has issued no request, so it is failed for
+    // exactly the reason a queued limiter waiter is failed.
+    const apiKey = await this.abandonOnDrain(
+      this.credentials.resolveFor(action.service, target.mode, target.host),
+      action.service,
+    );
     const bucketKey = bucketKeyFor(action, target);
 
     // FR-26: retries are for idempotent reads only. A write that fails is
@@ -166,7 +282,7 @@ export class UnifiClient {
         const transient = retryable && err instanceof UnifiError && TRANSIENT_ERRORS.has(err);
         if (!transient || attempt === maxAttempts) throw err;
         lastError = err;
-        await this.sleep(this.backoffMs(attempt, null));
+        await this.waitOrAbandon(this.backoffMs(attempt, null), action.service, lastError);
         continue;
       }
 
@@ -189,7 +305,7 @@ export class UnifiClient {
       if (retryAfter !== null && retryAfter > this.config.retry.maxRetryAfterSeconds) throw error;
 
       lastError = error;
-      await this.sleep(this.backoffMs(attempt, retryAfter));
+      await this.waitOrAbandon(this.backoffMs(attempt, retryAfter), action.service, lastError);
     }
 
     /* c8 ignore next */
@@ -203,6 +319,167 @@ export class UnifiClient {
     const exponential = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1));
     // Jitter keeps a fan-out across many consoles from re-colliding in lockstep.
     return Math.round(exponential * (0.5 + Math.random() / 2));
+  }
+
+  /**
+   * Serve the retry backoff, unless the client is drained first.
+   *
+   * Abandonment is signalled by an `AbortController`, never by a long-lived
+   * promise that is rejected at drain and raced with `Promise.race`. `race`
+   * attaches a handler to that promise only while a backoff is actually in
+   * progress, so on the overwhelmingly common shutdown — nothing in flight —
+   * the rejection would land with no handler attached and Node's default
+   * `--unhandled-rejections=throw` would terminate the process on the next
+   * tick, before the remaining drain steps ran. An `AbortSignal` carries no
+   * notion of an unhandled anything, and the rejection below is built inside a
+   * continuation that always has a consumer. This is the same shape
+   * `RateLimiter.waitOrAbandon` uses, and for the same reason.
+   *
+   * The listener is removed on either settlement path, so an idle process
+   * accumulates nothing.
+   *
+   * There is no separate "stop retrying" check: the rejection propagates out of
+   * `request()`, so no further attempt is a consequence of abandonment rather
+   * than a second mechanism that could disagree with it.
+   */
+  private waitOrAbandon(waitMs: number, service: ServiceId, cause: unknown): Promise<void> {
+    const signal = this.drainAbort.signal;
+    // The seconds this backoff had already computed, carried through unchanged
+    // rather than recomputed or nulled.
+    const seconds = Math.ceil(waitMs / 1000);
+    if (signal.aborted) return Promise.reject(this.shutdownError(service, seconds, cause));
+
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => reject(this.shutdownError(service, seconds, cause));
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      const settled = (): void => signal.removeEventListener('abort', onAbort);
+
+      // When `close()` clears a pending default-sleep timer, that sleep's own
+      // promise never resolves. Safe precisely because `onAbort` has already
+      // rejected the promise returned here, so the awaiting caller is settled
+      // either way — an awaiting caller is never left with a promise that never
+      // settles.
+      this.sleep(waitMs).then(
+        () => {
+          settled();
+          resolve();
+        },
+        (error: unknown) => {
+          settled();
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /**
+   * Fail an awaited preparation step when the drain begins.
+   *
+   * Same `AbortController` shape and same reasoning as `waitOrAbandon`; only
+   * the thing being waited on differs.
+   *
+   * Abandoning the promise does NOT abandon the work behind it, and pretending
+   * otherwise would be the more comfortable lie: on any shape carrying
+   * `keytar`, an in-flight `getPassword` is a libuv threadpool request holding
+   * a `ref`'d handle, so the *action* returns at once while the *process* still
+   * waits for the keychain. The architecture records this as a known residual
+   * (§2.4) whose only real fix — resolving credentials eagerly at startup — is
+   * a behavioural change to startup that no requirement asks for. It is not
+   * fixed here.
+   */
+  private abandonOnDrain<T>(work: Promise<T>, service: ServiceId): Promise<T> {
+    const signal = this.drainAbort.signal;
+    if (signal.aborted) {
+      // No continuation is attached below on this path, so the work's own
+      // settlement must be consumed here or an upstream credential failure
+      // would surface later as an unhandled rejection.
+      void work.catch(() => undefined);
+      return Promise.reject(this.shutdownError(service, SHUTDOWN_RETRY_AFTER_SECONDS));
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void =>
+        reject(this.shutdownError(service, SHUTDOWN_RETRY_AFTER_SECONDS));
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      const settled = (): void => signal.removeEventListener('abort', onAbort);
+
+      // Attached unconditionally, so the abandoned work always has a consumer
+      // for its eventual rejection even though nothing reads its value.
+      work.then(
+        (value) => {
+          settled();
+          resolve(value);
+        },
+        (error: unknown) => {
+          settled();
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /**
+   * The default backoff sleep, with its handle captured so `close()` can
+   * release it.
+   *
+   * Both halves are required and each alone is insufficient: the abort stops
+   * the *action* waiting, the cleared handle stops the *process* being held
+   * open. With only the abort, a 30-second `Retry-After` backoff keeps a
+   * `ref`'d timer alive to the hard stop on an otherwise clean shutdown.
+   *
+   * The timer is deliberately NOT `unref()`'d: an unreferenced timer would let
+   * the process exit while a legitimate in-flight tool call is still queued,
+   * which is reachable on a short stdio session. `ratelimit.ts` records the same
+   * departure for the same reason.
+   */
+  private trackedSleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const handle = setTimeout(() => {
+        this.pendingTimers.delete(handle);
+        resolve();
+      }, ms);
+      this.pendingTimers.add(handle);
+    });
+  }
+
+  /**
+   * The drain rejection: the existing `rate_limit` contract, naming shutdown.
+   *
+   * No new `ErrorCategory` member is introduced, which keeps NFR-24's closed
+   * `reject_reason` vocabulary intact. The semantic cost is real — a caller
+   * sees `rate_limit` for "the server is shutting down" — and FR-70 mandates
+   * it. `retryAfterSeconds` is always a number, never null: every `rate_limit`
+   * error this codebase constructs carries one, and the recovery hint reads it.
+   */
+  private shutdownError(
+    service: ServiceId,
+    retryAfterSeconds: number,
+    cause?: unknown,
+  ): UnifiError {
+    const error = new UnifiError({
+      category: 'rate_limit',
+      service,
+      httpStatus: null,
+      upstreamCode: null,
+      message:
+        `The outbound client was shut down, so the ${service} request was released instead of ` +
+        `being sent or retried. Nothing was rejected upstream.`,
+      correlationId: null,
+      origin: null,
+      recoveryHint:
+        `This server instance is shutting down and admits no further requests. Retry in ` +
+        `${retryAfterSeconds}s against a newly started instance.`,
+      retryAfterSeconds,
+    });
+    // `UnifiError`'s constructor takes only `normalized`, and src/types.ts is
+    // outside this change's budget, so the failure that provoked the abandoned
+    // wait is attached through the standard `Error.cause` property instead.
+    // Discarding it is a diagnostic regression: it is the only surviving record
+    // of why the request was retrying at all.
+    if (cause !== undefined && cause !== null) error.cause = cause;
+    return error;
   }
 
   private hostOverride(action: Action, args: Record<string, unknown>): string | undefined {
@@ -269,11 +546,17 @@ export class UnifiClient {
     const controller = new AbortController();
     const timeoutMs = this.config.connectorTimeoutMs;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // FR-70 step 7: this controller is the only handle on an in-flight attempt,
+    // so tracking it is what makes `close()` able to abort one. Purely
+    // additive — the controller already exists and is already passed as
+    // `signal`; request construction is untouched.
+    this.inFlight.add(controller);
 
     try {
       return await this.transmit(action, target, url, headers, payload, controller, timeoutMs);
     } finally {
       clearTimeout(timer);
+      this.inFlight.delete(controller);
     }
   }
 
@@ -364,6 +647,15 @@ export class UnifiClient {
     const code = (e as NodeJS.ErrnoException).code ?? '';
 
     if (e.name === 'AbortError' || code === 'ABORT_ERR') {
+      // One added condition, exactly as the architecture's admit-list states
+      // it. A drain-aborted attempt did not time out, and reporting a 25s
+      // deadline that never elapsed is false to both the caller and the log.
+      // A finer predicate — tracing the abort back to its own controller —
+      // would be a deviation from the admit-list the diff-scope check is
+      // written against, and buys nothing: while draining, no attempt is
+      // waiting on anything else.
+      if (this.draining) return this.shutdownError(action.service, SHUTDOWN_RETRY_AFTER_SECONDS, e);
+
       const where =
         target.mode === 'connector'
           ? `console ${target.consoleId} via the Cloud Connector`

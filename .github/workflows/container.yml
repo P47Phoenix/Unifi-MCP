@@ -15,9 +15,9 @@
 #
 # ## What is published
 #
-# ghcr.io/p47phoenix/unifi-mcp — a **stdio** MCP server. It does not listen on
-# a port; see "Deploying this" in README.md before handing it to a platform
-# team.
+# ghcr.io/p47phoenix/unifi-mcp — an MCP server that speaks **stdio** by
+# default, or streamable-HTTP when `UNIFI_MCP_TRANSPORT=http`. See "Deploying
+# this" in README.md before handing it to a platform team.
 
 name: Container
 
@@ -82,9 +82,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY_IMAGE }}
+          # This overrides the Dockerfile's own LABEL on every build, so the two
+          # description strings are kept byte-identical: correcting one and not
+          # the other leaves the published image asserting something false.
           labels: |
             org.opencontainers.image.title=unifi-mcp
-            org.opencontainers.image.description=MCP server over the four published Ubiquiti UniFi developer APIs. Speaks MCP over stdio; does not listen on a port.
+            org.opencontainers.image.description=MCP server over the four published Ubiquiti UniFi developer APIs (Site Manager, Network, Protect, Mobility). Speaks MCP over stdio by default, or streamable-HTTP when UNIFI_MCP_TRANSPORT=http.
 
       # A pull_request build produces no image: it exists to prove the
       # Dockerfile still builds — including the `--selftest` it runs internally
@@ -273,6 +276,8 @@ jobs:
             echo
             echo "Platforms: \`linux/arm64\`, \`linux/amd64\` — both built natively."
             echo
-            echo "This is a **stdio** MCP server. It does not listen on a port; run it"
-            echo "with \`docker run -i\`. See \"Deploying this\" in README.md."
+            echo "This is a **stdio** MCP server by default — run it with"
+            echo "\`docker run -i\`. Set \`UNIFI_MCP_TRANSPORT=http\` and it serves"
+            echo "streamable-HTTP on \`UNIFI_HTTP_PORT\` (default 8787) instead."
+            echo "See \"Deploying this\" in README.md."
           } >> "$GITHUB_STEP_SUMMARY"

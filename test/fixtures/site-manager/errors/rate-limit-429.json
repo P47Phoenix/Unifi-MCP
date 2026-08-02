@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "listSites (GET /v1/sites)",
+    "pointer": "#/paths/~1v1~1sites/get/responses/401/content/application~1json/schema",
+    "note": "Spec-authentic, verbatim from the 429 example. Pair with a Retry-After header to exercise FR-26; the body itself carries the delay only as prose, which is not machine-readable."
+  },
+  "body": {
+    "code": "rate_limit",
+    "httpStatusCode": 429,
+    "message": "rate limit exceeded, retry after 5.372786998s",
+    "traceId": "a7dc15e0eb4527142d7823515b15f87d"
+  }
+}

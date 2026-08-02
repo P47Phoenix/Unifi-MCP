@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "getSdWanConfigById (GET /v1/sd-wan-configs/{id})",
+    "pointer": "#/paths/~1v1~1sd-wan-configs~1{id}/get/responses/404/content/application~1json/schema",
+    "note": "Spec-authentic and the direct counterexample to the file above: /v1/sd-wan-configs/{id} emits lowercase `not_found` for the same condition. Same category, different route through the mapper. The spec is internally inconsistent here; both spellings must normalize identically."
+  },
+  "body": {
+    "code": "not_found",
+    "httpStatusCode": 404,
+    "message": "sd-wan config not found",
+    "traceId": "a7dc15e0eb4527142d7823515b15f87d"
+  }
+}

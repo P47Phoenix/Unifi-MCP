@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listWorkspaces (GET /v1/mobility/workspaces)",
+    "pointer": "#/components/schemas/ErrorResponse",
+    "note": "Spec-authentic, from the workspaces 500 example — the only place `server_error` is actually used. code present, so origin gateway."
+  },
+  "body": {
+    "code": "server_error",
+    "httpStatusCode": 500,
+    "message": "failed to proxy request",
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c"
+  }
+}

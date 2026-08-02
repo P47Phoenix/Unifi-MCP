@@ -1,0 +1,20 @@
+{
+  "$provenance": {
+    "spec": "specs/protect/v7.1.87/openapi.json",
+    "operation": "default response of GET /v1/cameras",
+    "pointer": "#/components/schemas/genericError",
+    "note": "Exercises the optional recursive `cause`. The mapper reads only the top-level error and name, so the nested cause must be ignored without throwing — a nested object where a string is expected is exactly what a naive parser trips on."
+  },
+  "body": {
+    "error": "Unexpected API error occurred",
+    "name": "API_ERROR",
+    "cause": {
+      "error": "Unexpected functionality error",
+      "name": "UNKNOWN_ERROR",
+      "cause": {
+        "error": "nvr storage subsystem offline",
+        "name": "STORAGE_ERROR"
+      }
+    }
+  }
+}

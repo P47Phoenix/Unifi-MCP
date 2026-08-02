@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/ErrorResponse",
+    "note": "FR-40 branch 3 of 4. Contains \"subscription\" and none of the earlier triggers, so the hint must name the missing cloud subscription."
+  },
+  "body": {
+    "code": "forbidden",
+    "httpStatusCode": 403,
+    "message": "device has no active cloud subscription for this operation",
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c"
+  }
+}

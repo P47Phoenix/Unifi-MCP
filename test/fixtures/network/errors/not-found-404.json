@@ -1,0 +1,17 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "orphan schema — $ref'd by no operation in this spec version",
+    "pointer": "#/components/schemas/Error Message",
+    "note": "Hand-derived. `api.common.` matches no prefix rule, proving the dotted-prefix table does not over-match and the status map still answers."
+  },
+  "body": {
+    "code": "api.common.resource-not-found",
+    "message": "Site not found",
+    "requestId": "3fa85f64-5717-4562-b3fc-2c963f66afa8",
+    "requestPath": "/integration/v1/sites/999",
+    "statusCode": 404,
+    "statusName": "NOT_FOUND",
+    "timestamp": "2024-11-27T08:15:11.402Z"
+  }
+}

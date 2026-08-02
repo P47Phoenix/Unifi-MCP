@@ -16,8 +16,28 @@
  *     `description` is where "device" appears in half the Protect spec.
  *
  * So terms are expanded through a domain vocabulary and scored per field.
+ *
+ * ## Why this module also ranks the never-ship blocklist (FR-46)
+ *
+ * A query that matches something deliberately withheld must be told so, or
+ * silence reads as "this API cannot do that", which is false. Deciding *which*
+ * withheld operations a query matches is the same problem as deciding which
+ * actions it matches, and answering it with a second, weaker algorithm is how
+ * the previous substring test managed to miss "reboot an access point" — a
+ * query that names neither the path nor the discriminator.
+ *
+ * So `searchBlocklist` runs the blocklist through `expandConcepts` and
+ * `scoreAction`, the very functions that produced the shown results, giving the
+ * withheld set and the shown set consistent recall by construction.
+ *
+ * It takes the entries as an **argument** (`readonly BlocklistEntry[]`) rather
+ * than importing `../registry/blocklist.js`. Two reasons: this module stays a
+ * pure ranking module with no dependency on the registry, so it can be reasoned
+ * about and tested without one; and the caller keeps the choice of which
+ * blocklist is in force, which is a policy decision and does not belong to the
+ * ranker. Only the `BlocklistEntry` *type* is imported, from `../types.js`.
  */
-import type { Action, ServiceId } from '../types.js';
+import type { Action, ActionParameter, BlocklistEntry, HttpMethod, ServiceId } from '../types.js';
 
 /** Words that carry no selection signal in a question-shaped query. */
 const STOPWORDS = new Set([
@@ -55,6 +75,11 @@ const SYNONYMS: Record<string, readonly string[]> = {
   adopt: ['device', 'pending'],
   adopted: ['device'],
   pending: ['pending', 'device'],
+  // Ubiquiti spells the reboot verb `RESTART`. Both literals are kept, because
+  // unlike "access" neither word means anything else in this domain, so keeping
+  // them cannot pull in an unrelated resource the way "access"/ACL did.
+  reboot: ['restart', 'reboot'],
+  restart: ['restart', 'reboot'],
 
   // State language.
   offline: ['device', 'state', 'status'],
@@ -227,11 +252,6 @@ export function expandConcepts(query: string): QueryConcept[] {
   return concepts;
 }
 
-/** Flattened variants, kept for callers that only want the term list. */
-export function expandQuery(query: string): string[] {
-  return [...new Set(expandConcepts(query).flatMap((c) => c.variants))];
-}
-
 /**
  * True for endpoints that return a collection.
  *
@@ -320,4 +340,242 @@ export function searchActions(
     // Ties break on ID so results are stable across calls (NFR-22).
     .sort((a, b) => b.score - a.score || a.action.id.localeCompare(b.action.id))
     .slice(0, limit);
+}
+
+// ---------------------------------------------------------------------------
+// Blocklist ranking (FR-46)
+// ---------------------------------------------------------------------------
+
+/**
+ * The three-way disposition of a spec operation (FR-46, G-1).
+ *
+ * `reachable` is the third value and is not modelled here: a reachable
+ * operation is an `Action` in the registry, so it never reaches this type.
+ */
+export type Disposition = 'whole-operation' | 'variant-withheld';
+
+/**
+ * One withheld operation matching a query.
+ *
+ * Deliberately carries no action ID and no execute-tool name: this is the
+ * *non*-invocable half of the answer, and anything here that looked like a
+ * handle would be an alternative route to the very thing FR-46 withholds. The
+ * recorded justifications travel as `reasons` rather than as the underlying
+ * entries, so a caller rendering this cannot reach a field the composer has not
+ * decided how to say.
+ */
+export interface WithheldMatch {
+  service: ServiceId;
+  method: HttpMethod;
+  /** The entry's own path, verbatim — never the enriched scoring path below. */
+  path: string;
+  disposition: Disposition;
+  /** Withheld discriminator values. Empty for a whole-operation block. */
+  variants: string[];
+  /** One recorded reason per contributing entry, in blocklist order. */
+  reasons: string[];
+  score: number;
+}
+
+export interface BlocklistSearchOptions {
+  service?: ServiceId;
+  limit?: number;
+}
+
+/**
+ * Ceiling on the withheld set.
+ *
+ * The explanation is a footnote to the answer, not the answer. Three keeps a
+ * query like "adopt a new access point" — which legitimately matches the
+ * adoption block, the un-adoption block and the restart variant — informative
+ * without the withheld list outweighing the actions the caller can actually
+ * run.
+ */
+const WITHHELD_MATCH_CAP = 3;
+
+/** Verb a bare HTTP method stands for, for the synthetic record's prose. */
+const METHOD_VERB: Record<HttpMethod, string> = {
+  GET: 'get',
+  POST: 'create',
+  PUT: 'replace',
+  PATCH: 'update',
+  DELETE: 'delete',
+} as const;
+
+/**
+ * Path segments that dispatch rather than name a resource.
+ *
+ * Network hangs its dangerous verbs off generic `.../actions` endpoints, so the
+ * terminal segment says nothing about what the operation acts on. The segment
+ * before it does.
+ */
+const DISPATCH_SEGMENTS: ReadonlySet<string> = new Set(['actions']);
+
+/** Every operation is one blocklist group; entries can share a path (FR-46). */
+interface WithheldOperation {
+  service: ServiceId;
+  method: HttpMethod;
+  path: string;
+  entries: BlocklistEntry[];
+}
+
+function operationKey(service: string, method: string, path: string): string {
+  return `${service} ${method} ${path}`;
+}
+
+/** Non-parameter, non-version path segments, lowercased. */
+function pathNouns(path: string): string[] {
+  return path
+    .split('/')
+    .filter((s) => s && !s.startsWith('{') && !s.startsWith('*') && !/^v\d+$/i.test(s))
+    .map((s) => s.toLowerCase());
+}
+
+/** What the operation acts on: its last path noun that is not a dispatcher. */
+function subjectOf(path: string): string {
+  const nouns = pathNouns(path);
+  const subject = [...nouns].reverse().find((noun) => !DISPATCH_SEGMENTS.has(noun));
+  return subject ?? nouns[nouns.length - 1] ?? '';
+}
+
+/** `POWER_CYCLE` / `disable-mic-permanently` → `power cycle` / `disable mic permanently`. */
+function humanise(token: string): string {
+  return token.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function slugify(phrase: string): string {
+  return humanise(phrase).replace(/ /g, '_');
+}
+
+/** Path parameters the real operation would carry, so the shape penalty matches. */
+function pathParametersOf(path: string): ActionParameter[] {
+  return [...path.matchAll(/\{([^}]+)\}/g)].map(([, name]) => ({
+    name: name ?? '',
+    location: 'path' as const,
+    required: true,
+    description: '',
+    schema: null,
+  }));
+}
+
+/**
+ * An `Action`-shaped record standing in for a withheld operation, so that
+ * `scoreAction` — and not a second, weaker matcher — decides what a query
+ * matches.
+ *
+ * Two enrichments earn their keep, and neither is ever shown to a caller:
+ *
+ *  - **The scoring path gains the discriminator.** For a variant withholding
+ *    the withheld thing is the variant, not the endpoint; `resourceOf` on
+ *    `/…/devices/{deviceId}/actions` yields `actions`, which scores every
+ *    variant of every dispatcher identically. Appending `restart` makes the
+ *    record describe what is actually withheld. `WithheldMatch.path` still
+ *    reports the entry's own path.
+ *  - **`id` and `summary` name the verb and the subject.** "reboot an access
+ *    point" carries no path word at all; without `restart` and `devices` as
+ *    text there is nothing for concept expansion to land on.
+ *
+ * The recorded reason is the description, which is legitimate: it is prose
+ * about this operation and it is already surfaced in the explanation.
+ */
+function syntheticAction(operation: WithheldOperation): Action {
+  const variants = withheldVariants(operation);
+  const subject = subjectOf(operation.path);
+  const verbs = variants.length > 0
+    ? variants.map(humanise)
+    : [METHOD_VERB[operation.method]];
+  const scoringPath = variants.length > 0
+    ? `${operation.path}/${variants.map(slugify).join('-')}`
+    : operation.path;
+
+  return {
+    id: `${slugify(verbs.join(' '))}_${slugify(subject)}`,
+    service: operation.service,
+    method: operation.method,
+    path: scoringPath,
+    actionClass: operation.method === 'GET' ? 'read' : 'write',
+    summary: `${verbs.join(' and ')} ${humanise(subject)}`,
+    description: operation.entries.map((e) => e.reason).join(' '),
+    tags: [],
+    parameters: pathParametersOf(operation.path),
+    earlyAccess: false,
+    requiredScopes: [],
+    searchText: '',
+  };
+}
+
+/**
+ * Discriminator values withheld from an operation that is otherwise reachable.
+ *
+ * Empty when any entry blocks the whole operation: a path carrying both an
+ * unqualified entry and a discriminated one is blocked outright, and the
+ * discriminated entry adds nothing. The registry cannot produce that today, but
+ * the disposition must not depend on entry order if it ever does.
+ */
+function withheldVariants(operation: WithheldOperation): string[] {
+  if (operation.entries.some((e) => !e.discriminator)) return [];
+  return operation.entries.map((e) => e.discriminator ?? '');
+}
+
+function groupByOperation(entries: readonly BlocklistEntry[]): WithheldOperation[] {
+  const groups = new Map<string, WithheldOperation>();
+  for (const entry of entries) {
+    const key = operationKey(entry.service, entry.method, entry.path);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.entries.push(entry);
+      continue;
+    }
+    groups.set(key, {
+      service: entry.service,
+      method: entry.method,
+      path: entry.path,
+      entries: [entry],
+    });
+  }
+  return [...groups.values()];
+}
+
+/**
+ * Withheld operations a query matches, ranked by the same scorer as the shown
+ * results (FR-46).
+ *
+ * Blocklist entries are passed in rather than imported — see the module doc.
+ * There is no `actionClass` filter: every blocklist entry is a write, so
+ * honouring `action_class=read` here would suppress the whole explanation and
+ * restore exactly the silence FR-46 exists to end.
+ */
+export function searchBlocklist(
+  entries: readonly BlocklistEntry[],
+  query: string,
+  options: BlocklistSearchOptions = {},
+): WithheldMatch[] {
+  const concepts = expandConcepts(query);
+  const limit = Math.min(Math.max(options.limit ?? WITHHELD_MATCH_CAP, 1), WITHHELD_MATCH_CAP);
+
+  return groupByOperation(entries)
+    .filter((operation) => !options.service || operation.service === options.service)
+    .map((operation) => ({ operation, score: scoreAction(syntheticAction(operation), concepts) }))
+    .filter((candidate) => candidate.score > 0)
+    // Ties break on the operation key so the set is stable across calls (NFR-22).
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        operationKey(a.operation.service, a.operation.method, a.operation.path).localeCompare(
+          operationKey(b.operation.service, b.operation.method, b.operation.path),
+        ),
+    )
+    .slice(0, limit)
+    .map(({ operation, score }) => {
+      const variants = withheldVariants(operation);
+      return {
+        service: operation.service,
+        method: operation.method,
+        path: operation.path,
+        disposition: variants.length > 0 ? 'variant-withheld' : 'whole-operation',
+        variants,
+        reasons: operation.entries.map((e) => e.reason),
+        score,
+      };
+    });
 }

@@ -1,0 +1,46 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "getConnectedClientOverviewPage (GET /v1/sites/{siteId}/clients)",
+    "pointer": "#/components/schemas/Client overview page",
+    "note": "First page of an offset/limit chain sized so it terminates: totalCount 5, limit 3, offset 0. Items follow #/components/schemas/Wired client overview and Wireless client overview; the subtype required-list drops the `type` discriminator but a real body still carries it, so these do."
+  },
+  "body": {
+    "count": 3,
+    "limit": 3,
+    "offset": 0,
+    "totalCount": 5,
+    "data": [
+      {
+        "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+        "name": "reception-desktop",
+        "type": "WIRED",
+        "access": { "type": "DEFAULT" },
+        "ipAddress": "192.168.1.55",
+        "connectedAt": "2026-07-28T09:14:02.331Z",
+        "macAddress": "94:2a:6f:26:c6:ca",
+        "uplinkDeviceId": "9f1b0c2d-3e4f-5061-7283-94a5b6c7d8e9"
+      },
+      {
+        "id": "3fa85f64-5717-4562-b3fc-2c963f66afa7",
+        "name": "warehouse-scanner",
+        "type": "WIRELESS",
+        "access": { "type": "DEFAULT" },
+        "ipAddress": "192.168.1.56",
+        "connectedAt": "2026-07-29T17:41:55.002Z",
+        "macAddress": "94:2a:6f:26:c6:cb",
+        "uplinkDeviceId": "9f1b0c2d-3e4f-5061-7283-94a5b6c7d8ea"
+      },
+      {
+        "id": "3fa85f64-5717-4562-b3fc-2c963f66afa8",
+        "name": "guest-laptop",
+        "type": "WIRELESS",
+        "access": { "type": "GUEST" },
+        "ipAddress": "192.168.3.12",
+        "connectedAt": "2026-07-31T08:02:10.500Z",
+        "macAddress": "94:2a:6f:26:c6:cc",
+        "uplinkDeviceId": "9f1b0c2d-3e4f-5061-7283-94a5b6c7d8ea"
+      }
+    ]
+  }
+}

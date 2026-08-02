@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/ErrorResponse",
+    "note": "FR-40 branch 4 of 4 and the spec-authentic one: the real 403 example says only \"insufficient permissions\", which matches no trigger. This is the case the three-cause fallback exists for — guessing a single cause here would send the user to the wrong console."
+  },
+  "body": {
+    "code": "forbidden",
+    "httpStatusCode": 403,
+    "message": "insufficient permissions",
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c"
+  }
+}
