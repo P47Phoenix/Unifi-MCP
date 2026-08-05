@@ -206,6 +206,46 @@ const DEFAULT_LOCAL_KEY_ENV = 'UNIFI_LOCAL_API_KEY';
 const LOCAL_HOST_PREFIX = 'UNIFI_LOCAL_HOST_';
 const LOCAL_KEY_PREFIX = 'UNIFI_LOCAL_API_KEY_';
 
+/**
+ * §5.15.1b: the suffix that turns a credential variable into its file sibling,
+ * and the suffix RESERVED across the `UNIFI_LOCAL_API_KEY_` family.
+ *
+ * `UNIFI_LOCAL_API_KEY_FILE` is file delivery for the DEFAULT console and is
+ * never a key for a console labelled `FILE`; `UNIFI_LOCAL_API_KEY_<LABEL>_FILE`
+ * is file delivery for `<LABEL>` and is never a key for `<LABEL>_FILE`. Without
+ * the reservation both spellings parse as consoles, pass the unknown-key check
+ * and are then silently ignored, because `collectLocalConsoles` derives its
+ * label set from the HOST variables — an operator's key accepted and discarded.
+ *
+ * Duplicated from `RESERVED_FILE_SUFFIX` in `src/serve/auth.ts` and
+ * `CREDENTIAL_FILE_SUFFIX` in `src/credentials.ts`: this module may import
+ * neither (see the module comment's architectural constraint), so the three
+ * copies are pinned to each other by `test/credentials-file.test.ts`.
+ */
+const CREDENTIAL_FILE_SUFFIX = '_FILE';
+const CLOUD_API_KEY_FILE_ENV = `${CLOUD_API_KEY_ENV}${CREDENTIAL_FILE_SUFFIX}`;
+const DEFAULT_LOCAL_KEY_FILE_ENV = `${DEFAULT_LOCAL_KEY_ENV}${CREDENTIAL_FILE_SUFFIX}`;
+
+/**
+ * True for a local console label the `_FILE` reservation makes unaddressable.
+ * `FILENAME` and `MYFILE` are unaffected: the reservation is the trailing
+ * `_FILE`, plus the bare label `FILE`.
+ */
+function isReservedLocalLabel(label: string): boolean {
+  return label === 'FILE' || label.endsWith(CREDENTIAL_FILE_SUFFIX);
+}
+
+/** The refusal for a console the reservation makes unaddressable (§5.15.1b). */
+function reservedLocalLabelProblem(label: string): string {
+  return (
+    `${LOCAL_HOST_PREFIX}${label} names a console whose label is unaddressable: the trailing ` +
+    `${CREDENTIAL_FILE_SUFFIX} suffix is reserved for file delivery, so ${LOCAL_KEY_PREFIX}${label} ` +
+    `would be read as a file path for another console and this console's key could be set but ` +
+    `never read. Rename the console to a label that is not FILE and does not end in ` +
+    `${CREDENTIAL_FILE_SUFFIX}.`
+  );
+}
+
 /** Env spelling of a service id: `site-manager` -> `SITE_MANAGER`. */
 function envToken(service: ServiceId): string {
   return service.toUpperCase().replace(/-/g, '_');
@@ -251,6 +291,13 @@ export const SERVING_ENV_KEYS: readonly string[] = [
 /** Exported so a table-driven test can compare the recognised set in-process. */
 export const SCALAR_ENV_KEYS: readonly string[] = [
   CLOUD_API_KEY_ENV,
+  // §5.15.1b, registered in the SAME change as the reader (FR-78). Without the
+  // registration `validateConfig` fatals on the variable the documentation
+  // tells a container operator to set. The third row of that table,
+  // `UNIFI_LOCAL_API_KEY_<LABEL>_FILE`, needs no entry: the local-key rule in
+  // `isKnownEnvKey` already covers every `UNIFI_LOCAL_API_KEY_*` spelling.
+  CLOUD_API_KEY_FILE_ENV,
+  DEFAULT_LOCAL_KEY_FILE_ENV,
   DEFAULT_LOCAL_HOST_ENV,
   DEFAULT_LOCAL_KEY_ENV,
   'UNIFI_CONSOLE_ID',
@@ -740,6 +787,21 @@ function intersect(
   return out;
 }
 
+/**
+ * PRESENCE of a credential, by either delivery mechanism (FR-78).
+ *
+ * Reads the file variable for its PRESENCE only and never opens the file: this
+ * module does no credential I/O and `ServerConfig` carries no key material. A
+ * flag that ignored the `*_FILE` sibling would disable the service, refuse
+ * startup with "no UniFi API is usable", and never mention the variable the
+ * operator actually set — the accepted-then-discarded failure §5.15.1b forbids.
+ */
+function hasCredential(env: NodeJS.ProcessEnv, account: string): boolean {
+  return Boolean(
+    readString(env, account) ?? readString(env, `${account}${CREDENTIAL_FILE_SUFFIX}`),
+  );
+}
+
 function collectLocalConsoles(env: NodeJS.ProcessEnv, problems: string[]): LocalConsole[] {
   const hosts = new Map<string, string>();
 
@@ -750,6 +812,14 @@ function collectLocalConsoles(env: NodeJS.ProcessEnv, problems: string[]): Local
     if (!key.startsWith(LOCAL_HOST_PREFIX) || value === undefined) continue;
     const label = key.slice(LOCAL_HOST_PREFIX.length);
     if (label === '') continue;
+    // §5.15.1b, checked before the value: a refusal, not a warning, because the
+    // alternative is a console whose key can be set but never read. The console
+    // is NOT created — admitting it would leave the rest of startup reasoning
+    // about a console no variable can credential.
+    if (isReservedLocalLabel(label)) {
+      problems.push(reservedLocalLabelProblem(label));
+      continue;
+    }
     const host = normalizeHost(value);
     if (host === '') {
       problems.push(`${key} is set but empty.`);
@@ -760,7 +830,7 @@ function collectLocalConsoles(env: NodeJS.ProcessEnv, problems: string[]): Local
 
   return [...hosts.entries()].map(([label, host]) => {
     const apiKeyEnvVar = label === 'default' ? DEFAULT_LOCAL_KEY_ENV : LOCAL_KEY_PREFIX + label;
-    return { label, host, apiKeyEnvVar, hasApiKey: Boolean(readString(env, apiKeyEnvVar)) };
+    return { label, host, apiKeyEnvVar, hasApiKey: hasCredential(env, apiKeyEnvVar) };
   });
 }
 
@@ -802,7 +872,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, options: LoadConfigOptions = 
   // that loadConfig never half-fails: it always returns a usable object.
   const problems: string[] = [];
 
-  const hasCloudApiKey = Boolean(readString(env, CLOUD_API_KEY_ENV));
+  const hasCloudApiKey = hasCredential(env, CLOUD_API_KEY_ENV);
   const consoleId = readString(env, 'UNIFI_CONSOLE_ID');
   const localConsoles = collectLocalConsoles(env, problems);
   const defaultLocalHost = localConsoles.find((c) => c.label === 'default')?.host
@@ -1182,6 +1252,24 @@ export function validateConfig(config: ServerConfig, env: NodeJS.ProcessEnv): Co
       `UNIFI_LOCAL_CA_BUNDLE (${config.caBundlePath}) and UNIFI_LOCAL_TLS_INSECURE=true are ` +
         `mutually exclusive: the bundle would never be consulted. Set exactly one.`,
     );
+  }
+
+  // §5.15.1b / FR-78: "Ambiguity about which secret is live is not resolved
+  // silently." Both spellings of one credential is exactly that ambiguity, and
+  // it is decidable from the environment alone — no file is opened here. The
+  // same problem is produced by `captureCredentialEnv` for a caller that
+  // resolves credentials without validating first; in the wired startup path
+  // this refusal is fatal before the capture runs, so it prints once.
+  for (const account of [
+    config.cloudApiKeyEnvVar,
+    ...config.localConsoles.map((c) => c.apiKeyEnvVar),
+  ]) {
+    const file = `${account}${CREDENTIAL_FILE_SUFFIX}`;
+    if (readString(env, account) !== null && readString(env, file) !== null) {
+      mutuallyExclusiveOptions.push(
+        `${account} and ${file} are both set and only one API key can be live. Set exactly one.`,
+      );
+    }
   }
 
   const enabledWithoutCredentials: string[] = [];
