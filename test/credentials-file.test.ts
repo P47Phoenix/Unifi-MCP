@@ -784,7 +784,21 @@ describe('Out of Scope #22: no credential ever arrives on the command line', () 
   });
 
   test('every process.argv read in src/ is a valueless mode flag', () => {
-    const permitted = /process\.argv\.includes\('--(?:selftest|healthcheck)'\)/g;
+    // Two permitted forms, not one.
+    //
+    // The mode flags are the original pair and carry no value. `process.argv[1]`
+    // was ADDED by US-18 and is the auto-run guard architecture §1.3 mandates:
+    // `import.meta.url === pathToFileURL(process.argv[1] ?? '').href`, which is
+    // what stops importing `src/index.ts` from starting a server and hijacking
+    // the test runner's signal handlers.
+    //
+    // Permitting it does not widen what this scan protects. Out of Scope #22 is
+    // about a SECRET arriving on the command line; `argv[1]` is the entry path
+    // Node itself put there, is never operator-supplied content, and is compared
+    // against a module URL rather than read as a value. The normative half of
+    // the requirement — that `src/credentials.ts` and `src/serve/auth.ts`
+    // contain no occurrence of `argv` at all — is asserted unchanged above.
+    const permitted = /process\.argv\.includes\('--(?:selftest|healthcheck)'\)|process\.argv\[1\]/g;
     let reads = 0;
     for (const file of sourceFiles(SRC)) {
       const source = readFileSync(file, 'utf8');

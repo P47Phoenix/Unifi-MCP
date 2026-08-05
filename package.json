@@ -29,7 +29,7 @@
     "inspect:cli": "npx @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@modelcontextprotocol/sdk": "~1.30.0",
     "zod": "^3.23.8"
   },
   "optionalDependencies": {

@@ -672,23 +672,41 @@ const INVENTORY: readonly InventoryEntry[] = [
     classification: 'redaction',
   },
 
-  // The entrypoint: one pass-through into the enforcement site, two banners.
-  // US-18 moves these into `src/serve/runtime.ts` and US-20 replaces the
-  // banners; both remain `observation` there — FR-71 permits the Runtime to
-  // READ the set and forbids it to BRANCH on it to permit or deny.
+  // The runtime: two pass-throughs into the enforcement site, two banners.
+  //
+  // MOVED FROM `src/index.ts` BY US-18, and the move is why this assertion is
+  // keyed on file plus expression rather than on a line number: the three
+  // entries that stood in the entrypoint went red the moment the split landed,
+  // which is the guard working. All four remain `observation` — FR-71 permits
+  // the Runtime to READ the set and forbids it to BRANCH on it to permit or
+  // deny, so `src/serve/` still carries zero `enforcement` sites.
+  //
+  // The single `advertisedTools(…, config.writesEnabled)` call became two,
+  // one per surface, because the runtime precomputes both advertised sets and
+  // the session selects between them (architecture §1.2). Reading a set and
+  // passing it as an argument is `pass-through`, not a second gate: the one
+  // advertisement decision stays at `src/tools/definitions.ts`.
   {
-    file: 'src/index.ts',
-    expression: 'const tools = advertisedTools(config.enabledServices, config.writesEnabled);',
+    file: 'src/serve/runtime.ts',
+    expression:
+      'stdio: advertisedTools(config.enabledServices, config.writesEnabledBySurface.stdio),',
     classification: 'pass-through',
   },
   {
-    file: 'src/index.ts',
+    file: 'src/serve/runtime.ts',
+    expression:
+      'http: advertisedTools(config.enabledServices, config.writesEnabledBySurface.http),',
+    classification: 'pass-through',
+  },
+  {
+    file: 'src/serve/runtime.ts',
     expression: 'if (config.writesEnabled.size === 0) {',
     classification: 'diagnostic',
   },
   {
-    file: 'src/index.ts',
-    expression: 'warn(`unifi-mcp: WRITES ENABLED for ${[...config.writesEnabled].join(\', \')}.`);',
+    file: 'src/serve/runtime.ts',
+    expression:
+      'state.warn(`WRITES ENABLED for ${[...config.writesEnabled].join(\', \')}.`);',
     classification: 'diagnostic',
   },
 ];
