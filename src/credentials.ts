@@ -31,6 +31,20 @@
  * with that object as `options.env`; only then does `scrubCredentialEnv` delete
  * the names from the environment the process was handed.
  *
+ * ## The bounded keychain call (FR-82, AR-1, RES-3)
+ *
+ * `resolveFor` precedes every outbound call, so an unbounded `getPassword` is
+ * an unbounded term in front of every tool call AND every drain. On the
+ * container shape that is invisible — `keytar` is absent by construction — and
+ * on the MCPB/desktop shape, which is the already-shipped product, a locked or
+ * wedged keychain daemon hangs the call and pushes the drain past its deadline
+ * into the hard stop. The keychain call is therefore bounded by a fixed
+ * `KEYCHAIN_TIMEOUT_MS`, and expiry is handled exactly as keychain
+ * unavailability already was: abandon, fall through to file and environment,
+ * warn once per account per window. What the bound cannot do is abandon the
+ * native call underneath (RES-3) — it abandons this process's interest in the
+ * answer, which is what the drain needs.
+ *
  * `scrubCredentialEnv` deletes from the object it is given and never from
  * `process.env` by default. In production the runtime hands it `process.env`,
  * so NFR-31 holds; a test that injects its own environment object leaves the
@@ -41,12 +55,89 @@ import { readFileSync, statSync } from 'node:fs';
 
 import type { ServerConfig } from './config.js';
 import { CLOUD_API_KEY_ENV } from './config.js';
-import type { ServiceId, TransportMode } from './types.js';
+import type { NormalizedError, ServiceId, TransportMode } from './types.js';
 import { UnifiError } from './types.js';
 import { localError } from './http/errors.js';
 
 /** Keychain service name. One entry per env-var name, so the two paths agree. */
 const KEYCHAIN_SERVICE = 'unifi-mcp';
+
+/**
+ * FR-82: the bound on the keychain call, and DELIBERATELY NOT A VARIABLE.
+ *
+ * FR-63 closes the serving-transport variable family, this is not
+ * serving-transport surface in any case, and an operator-tunable bound on a
+ * credential path invites `0` and a very large number — the two values the
+ * requirement exists to exclude. The documented remedy for a genuinely slow
+ * keychain is file or environment delivery (§5.15.1b, FR-78), not a longer
+ * timeout. Setting any `UNIFI_*` name for it therefore trips the existing
+ * unknown-key startup refusal, and no row for it appears in §5.15.1 or
+ * §5.15.1b; `test/credentials-timeout.test.ts` asserts both.
+ */
+export const KEYCHAIN_TIMEOUT_MS = 10_000;
+
+/**
+ * NFR-24: one warning per account per window. A wedged keychain is consulted
+ * again on every uncached resolution, and stderr is the operator's only
+ * diagnostic channel — an unbounded cadence buries the line that matters.
+ */
+export const KEYCHAIN_WARNING_WINDOW_MS = 60_000;
+
+/**
+ * The clock and timer the bound is measured with.
+ *
+ * A DEFAULT CONSTRUCTOR PARAMETER rather than a `CredentialStoreOptions` field:
+ * US-16 was permitted exactly one new option and this story none, Node 20 has
+ * no `mock.module`, and without a seam every assertion about a 10 000 ms bound
+ * costs 10 000 ms of real waiting — the ten-timeouts-in-one-window case alone
+ * would exceed the runner's 60 s per-test ceiling. Production never passes it,
+ * so the production path is the default object below and nothing else.
+ */
+export interface KeychainTimers {
+  /**
+   * Schedules the abandonment. The returned handle is opaque; the contract is
+   * that it MUST NOT hold the event loop open — a bound waiting to expire is
+   * not a reason for the process to stay alive, least of all during a drain.
+   */
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+  /** Milliseconds, for the warning window only. Never for the bound itself. */
+  now(): number;
+}
+
+/** The production clock: an `unref`'d timer, cleared on every settled path. */
+export const realKeychainTimers: KeychainTimers = {
+  setTimeout(fn: () => void, ms: number): unknown {
+    const handle = setTimeout(fn, ms);
+    // `unref` is what makes the timer invisible to the event loop's liveness
+    // check. Optional-chained because a non-Node timer shim has no such method.
+    handle.unref?.();
+    return handle;
+  },
+  clearTimeout(handle: unknown): void {
+    clearTimeout(handle as NodeJS.Timeout);
+  },
+  now(): number {
+    return Date.now();
+  },
+};
+
+/** The three ways a bounded keychain call ends. */
+type KeychainOutcome =
+  | { readonly status: 'settled'; readonly value: string | null }
+  | { readonly status: 'failed'; readonly error: Error }
+  | { readonly status: 'abandoned' };
+
+/** What one `lookup()` produced, and whether the keychain ran out of time. */
+interface LookupOutcome {
+  readonly value: string | null;
+  /**
+   * True when the keychain was consulted and the bound expired. Carried out to
+   * `resolveFor`, which is the only place that knows the service and can
+   * therefore render the structured error FR-82 specifies.
+   */
+  readonly keychainTimedOut: boolean;
+}
 
 /**
  * The slice of keytar's surface used here, declared locally so the optional
@@ -85,10 +176,13 @@ export class CredentialStore {
   private readonly cache = new Map<string, string>();
   private keytar: KeytarLike | null | undefined;
   private warnedNoKeychain = false;
+  /** Account -> the clock reading of the last timeout warning emitted for it. */
+  private readonly keychainWarnedAt = new Map<string, number>();
 
   constructor(
     private readonly config: ServerConfig,
     options: CredentialStoreOptions = {},
+    private readonly timers: KeychainTimers = realKeychainTimers,
   ) {
     this.env = options.env ?? process.env;
     this.warn = options.warn ?? ((m) => process.stderr.write(`${m}\n`));
@@ -136,8 +230,12 @@ export class CredentialStore {
       );
     }
 
-    const key = await this.lookup(console_.apiKeyEnvVar);
-    if (!key) {
+    const { value, keychainTimedOut } = await this.lookup(console_.apiKeyEnvVar);
+    if (!value) {
+      // FR-82: the timeout is a DIFFERENT failure from "nothing is configured",
+      // and saying the latter would be false — the key is configured and the
+      // keychain did not answer.
+      if (keychainTimedOut) throw new UnifiError(keychainTimeoutError(service, console_.apiKeyEnvVar));
       throw new UnifiError(
         localError(
           service,
@@ -149,12 +247,13 @@ export class CredentialStore {
         ),
       );
     }
-    return key;
+    return value;
   }
 
   private async resolveCloudKey(service: ServiceId): Promise<string> {
-    const key = await this.lookup(CLOUD_API_KEY_ENV);
-    if (!key) {
+    const { value, keychainTimedOut } = await this.lookup(CLOUD_API_KEY_ENV);
+    if (!value) {
+      if (keychainTimedOut) throw new UnifiError(keychainTimeoutError(service, CLOUD_API_KEY_ENV));
       throw new UnifiError(
         localError(
           service,
@@ -166,7 +265,7 @@ export class CredentialStore {
         ),
       );
     }
-    return key;
+    return value;
   }
 
   /**
@@ -180,41 +279,123 @@ export class CredentialStore {
    * constructed over an environment that still carries the path — which is
    * what makes file delivery work rather than being accepted and discarded.
    */
-  private async lookup(account: string): Promise<string | null> {
+  private async lookup(account: string): Promise<LookupOutcome> {
     const cached = this.cache.get(account);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) return { value: cached, keychainTimedOut: false };
 
+    let keychainTimedOut = false;
     const keytar = await this.loadKeytar();
     if (keytar) {
-      try {
-        const stored = await keytar.getPassword(KEYCHAIN_SERVICE, account);
-        if (stored) {
-          this.cache.set(account, stored);
-          return stored;
-        }
-      } catch (e) {
+      const outcome = await this.boundedKeychainLookup(keytar, account);
+      if (outcome.status === 'settled' && outcome.value) {
+        this.cache.set(account, outcome.value);
+        return { value: outcome.value, keychainTimedOut: false };
+      }
+      if (outcome.status === 'failed') {
         // A locked or unavailable keychain must not take the server down when
         // the env path would have worked.
         this.warn(
-          `unifi-mcp: keychain lookup for "${account}" failed (${(e as Error).message}); ` +
+          `unifi-mcp: keychain lookup for "${account}" failed (${outcome.error.message}); ` +
             `falling back to the environment.`,
         );
+      } else if (outcome.status === 'abandoned') {
+        keychainTimedOut = true;
+        this.warnKeychainTimeout(account);
       }
     }
 
+    // FR-82 handles expiry EXACTLY as keychain unavailability is already
+    // handled: fall through to file, then environment, and an operator who also
+    // supplies the key by variable or file sees no failure at all. A value
+    // found here is cached, as it is on the keychain-error path — what is never
+    // cached is the timeout itself, so "unlock the keychain and retry" works
+    // without a restart.
     const fromFile = this.readCredentialFile(account);
     if (fromFile) {
       this.cache.set(account, fromFile);
-      return fromFile;
+      return { value: fromFile, keychainTimedOut };
     }
 
     const fromEnv = this.env[account]?.trim();
     if (fromEnv) {
       if (!keytar) this.warnKeychainUnavailable();
       this.cache.set(account, fromEnv);
-      return fromEnv;
+      return { value: fromEnv, keychainTimedOut };
     }
-    return null;
+    return { value: null, keychainTimedOut };
+  }
+
+  /**
+   * The keychain call, bounded (FR-82). Returns; never rejects.
+   *
+   * ABANDONMENT, NOT REJECTION. The bound fires an `AbortController` and the
+   * returned promise RESOLVES with `abandoned`; the keychain's own promise is
+   * left to settle whenever it likes into handlers that are already attached.
+   * A design that races a REJECTING timeout promise was tried and taken out:
+   * whichever promise loses the race still settles, and a late rejection with
+   * no handler on it terminates the process — the drain this bound exists to
+   * unblock would be killed by the very mechanism meant to unblock it.
+   *
+   * The timer is cleared on every settled path and does not hold the event loop
+   * open (`realKeychainTimers`), so nothing here outlives the call and a pending
+   * bound never keeps a draining process alive.
+   *
+   * What this CANNOT do is abandon the underlying native call: `keytar` is a
+   * libuv threadpool work request holding a `ref`'d handle that no
+   * JavaScript-level timeout can release. That is RES-3, and the hard stop
+   * (exit 75) remains its backstop.
+   */
+  private boundedKeychainLookup(keytar: KeytarLike, account: string): Promise<KeychainOutcome> {
+    return new Promise<KeychainOutcome>((resolve) => {
+      const abandon = new AbortController();
+      const timer = this.timers.setTimeout(() => {
+        abandon.abort();
+        resolve({ status: 'abandoned' });
+      }, KEYCHAIN_TIMEOUT_MS);
+
+      const settle = (outcome: KeychainOutcome): void => {
+        // Already abandoned: the answer arrived too late to be used, and the
+        // timer has already fired. Discard it silently.
+        if (abandon.signal.aborted) return;
+        this.timers.clearTimeout(timer);
+        resolve(outcome);
+      };
+
+      let call: Promise<string | null>;
+      try {
+        call = keytar.getPassword(KEYCHAIN_SERVICE, account);
+      } catch (e) {
+        // A synchronous throw from the collaborator, which `await` would have
+        // turned into a rejection and the old code caught.
+        settle({ status: 'failed', error: asError(e) });
+        return;
+      }
+
+      // BOTH handlers are attached unconditionally and before the bound can
+      // expire, so a keychain that rejects after abandonment is handled rather
+      // than surfacing as an unhandled rejection.
+      void Promise.resolve(call).then(
+        (value) => settle({ status: 'settled', value }),
+        (e) => settle({ status: 'failed', error: asError(e) }),
+      );
+    });
+  }
+
+  /**
+   * FR-82 / NFR-24: one line per account per 60-second window. Ten consecutive
+   * timed-out resolutions inside one window produce exactly one line, because a
+   * wedged keychain must not flood the operator's only diagnostic channel.
+   */
+  private warnKeychainTimeout(account: string): void {
+    const now = this.timers.now();
+    const last = this.keychainWarnedAt.get(account);
+    if (last !== undefined && now - last < KEYCHAIN_WARNING_WINDOW_MS) return;
+    this.keychainWarnedAt.set(account, now);
+    this.warn(
+      `unifi-mcp: WARNING the OS keychain did not answer within ${KEYCHAIN_TIMEOUT_MS} ms for ` +
+        `${account}. The lookup was abandoned; if the keychain is locked, unlock it and retry — ` +
+        `or set ${credentialFileVar(account)} to bypass the keychain entirely.`,
+    );
   }
 
   /**
@@ -266,6 +447,31 @@ export class CredentialStore {
         'process environment.',
     );
   }
+}
+
+/**
+ * FR-82's structured refusal: the `timeout` category, in the existing
+ * three-line `toolError()` shape.
+ *
+ * It exists as its own function so the one thing it must never say — the
+ * "No cloud API key is configured…" text above — cannot be reintroduced here by
+ * an edit to the surrounding branch. The key IS configured in this case; the
+ * keychain did not answer.
+ */
+function keychainTimeoutError(service: ServiceId, account: string): NormalizedError {
+  return localError(
+    service,
+    'timeout',
+    `The OS keychain did not answer within ${KEYCHAIN_TIMEOUT_MS} ms for ${account}, and no ` +
+      `value was supplied by environment or file.`,
+    `Unlock the keychain and try again, or set ${credentialFileVar(account)} (or ${account}) ` +
+      `and restart the server.`,
+  );
+}
+
+/** Whatever a collaborator threw, as something with a `.message`. */
+function asError(e: unknown): Error {
+  return e instanceof Error ? e : new Error(String(e));
 }
 
 // ===========================================================================

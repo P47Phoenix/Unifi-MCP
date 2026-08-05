@@ -47,7 +47,7 @@ type Handler = (args: Record<string, unknown>) => Promise<ToolResult>;
  */
 function contextFor(registry: typeof actions): HandlerContext {
   const config = loadConfig({}, { repoRoot: REPO_ROOT });
-  const credentials = new CredentialStore(config, { env: {}, warn: () => {} });
+  const credentials = new CredentialStore(config, { env: {}, warn: () => {}, keychain: null });
   return {
     config,
     client: new UnifiClient(config, credentials, { warn: () => {} }),

@@ -225,16 +225,32 @@ export class UnifiClient {
     // FR-44: the interceptor point. Writes are unreachable unless the operator
     // named the service in UNIFI_ENABLE_WRITES — no argument reaches this
     // check, so no tool call can talk its way past it.
+    //
+    // FR-71 AC 1a: over the HTTP serving transport this same set was already
+    // narrowed ONCE, at configuration load, by UNIFI_HTTP_ALLOW_WRITES. Only
+    // the MESSAGE branches on the surface — one condition, one decision, one
+    // throw, so this stays the single outbound enforcement point and FR-71's
+    // inventory still holds at two. The branch exists because an operator on
+    // HTTP has typically already set UNIFI_ENABLE_WRITES, and the
+    // transport-agnostic text would tell them to do the thing they have done.
     if (action.actionClass === 'write' && !this.config.writesEnabled.has(action.service)) {
+      const narrowedByHttpGate = this.config.activeSurface === 'http';
       throw new UnifiError(
         localError(
           action.service,
           'config',
-          `Action \`${action.id}\` is a ${action.method} (state-changing) operation and writes ` +
-            `are not enabled for ${action.service}.`,
-          `Writes are off by default. To enable them, set UNIFI_ENABLE_WRITES=${action.service} ` +
-            `(or a comma-separated list) in the server environment and restart. This cannot be ` +
-            `enabled from a tool call.`,
+          narrowedByHttpGate
+            ? `Write actions are disabled on the HTTP serving transport. Writes over HTTP ` +
+              `require both UNIFI_ENABLE_WRITES and UNIFI_HTTP_ALLOW_WRITES, and the effective ` +
+              `set — the intersection of the two — is empty.`
+            : `Action \`${action.id}\` is a ${action.method} (state-changing) operation and ` +
+              `writes are not enabled for ${action.service}.`,
+          narrowedByHttpGate
+            ? `Set UNIFI_HTTP_ALLOW_WRITES to include this service on the server, then restart ` +
+              `it.`
+            : `Writes are off by default. To enable them, set ` +
+              `UNIFI_ENABLE_WRITES=${action.service} (or a comma-separated list) in the server ` +
+              `environment and restart. This cannot be enabled from a tool call.`,
         ),
       );
     }
