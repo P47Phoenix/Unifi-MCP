@@ -698,15 +698,24 @@ const INVENTORY: readonly InventoryEntry[] = [
       'http: advertisedTools(config.enabledServices, config.writesEnabledBySurface.http),',
     classification: 'pass-through',
   },
+  //
+  // AMENDED BY US-20, and amended rather than relaxed. The two banner reads
+  // that stood inline in `announceStartup` moved into two named predicates when
+  // D-12's read-only-banner suppression landed: `writeStateBanner` still reads
+  // the EFFECTIVE set to choose between the two banners, and `narrowedToEmpty`
+  // reads the PER-SURFACE sets to decide whether the HTTP narrowing is what
+  // emptied it — which is the whole suppression decision. Both remain
+  // `diagnostic`: they choose which line is printed and touch neither
+  // advertisement nor dispatch, so `src/serve/` still carries zero
+  // `enforcement` sites and the shrink-or-stay list below is untouched.
   {
     file: 'src/serve/runtime.ts',
-    expression: 'if (config.writesEnabled.size === 0) {',
+    expression: 'const surfaces = config.writesEnabledBySurface;',
     classification: 'diagnostic',
   },
   {
     file: 'src/serve/runtime.ts',
-    expression:
-      'state.warn(`WRITES ENABLED for ${[...config.writesEnabled].join(\', \')}.`);',
+    expression: 'const effective = config.writesEnabled;',
     classification: 'diagnostic',
   },
 ];

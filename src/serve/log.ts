@@ -57,6 +57,26 @@ import { SERVICE_IDS, type ServiceId } from '../types.js';
 /** Prefixes every line this module writes, so operator greps have one anchor. */
 export const LOG_PREFIX = 'unifi-mcp: ';
 
+/** `isIP` return code for IPv6, named so no bare `6` appears at a call site. */
+const IPV6_FAMILY = 6;
+
+/**
+ * Operator contract §0.1.4: `[::]:8787` for an IPv6 literal, `0.0.0.0:8787`
+ * otherwise — never `:::8787`.
+ *
+ * A SECOND IMPLEMENTATION of `renderAddress` in `src/config.ts`, and on
+ * purpose. That one is module-private and `config.ts` is not this story's file;
+ * more importantly `log.ts` is a leaf (architecture §5.8, §9.4) and importing
+ * `config.ts` here would put the configuration loader underneath the single
+ * emitter. The two are pinned to each other by `test/startup-diagnostics.test.ts`,
+ * which renders the same bind through this function and through the §3.3.2
+ * warning `config.ts` composes and requires the substrings to agree — the same
+ * treatment `canonicalizePath` gets for the same reason.
+ */
+export function renderBindAddress(bind: string, port: number): string {
+  return isIP(bind) === IPV6_FAMILY ? `[${bind}]:${port}` : `${bind}:${port}`;
+}
+
 /** Distinguishes the machine-readable request line from free-text diagnostics. */
 export const REQUEST_MARKER = 'req';
 
@@ -321,6 +341,64 @@ function clientField(client: string): string {
   return SAFE_CLIENT_CHARS.test(client) ? client : UNAVAILABLE_CLIENT;
 }
 
+/**
+ * ## The trusted-text path, and what makes a line trusted
+ *
+ * `sanitizeUntrusted` does two different jobs at once. Four of its transforms
+ * are INJECTION defences — line breaks, control characters, bidi overrides and
+ * the fence-forgery guard — and they must run over every byte this module
+ * writes, whatever composed it. The fifth is a 512-character CEILING, and that
+ * one is a FLOODING defence aimed at a specific population: per-field, free-text
+ * values a device or an API response chose, where "no legitimate device name
+ * approaches this" is the stated justification (`src/safety/sanitize.ts`).
+ *
+ * A line the server composed from its own resolved configuration is not in that
+ * population. Nothing about its length is attacker-chosen: the startup `ready`
+ * line renders `redactedSummary(config)`, which is about 1.2 kB on a four-API
+ * deployment, and putting it through the ceiling cut the operator's single most
+ * useful diagnostic off mid-JSON. Shortening the line would have hidden the bug
+ * rather than fixed it, so the split is made explicit here instead.
+ *
+ *   TRUSTED   — the process composed it from values it resolved itself: the
+ *               startup announcement, the serving line, the ordered startup
+ *               warnings. Injection defences apply; the ceiling does not.
+ *   UNTRUSTED — anything whose bytes a device, an API response or a remote peer
+ *               could choose: relayed collaborator diagnostics, registry
+ *               warnings, and every caught error. Both apply, unchanged.
+ *
+ * The transforms below are a DELIBERATE SECOND IMPLEMENTATION of the four
+ * `sanitizeUntrusted` applies before its ceiling. `src/safety/` is outside this
+ * story's file scope and exports neither the patterns nor a ceiling-free entry
+ * point, and the alternative — chunking the message through the existing
+ * function — cannot be made correct, because a fence-forgery string straddling
+ * a chunk boundary escapes the guard that exists to catch it.
+ *
+ * A duplicated security primitive is a real drift hazard and this repository
+ * has already paid for one, so the copy is not left to review:
+ * `test/startup-diagnostics.test.ts` asserts byte-for-byte agreement with
+ * `sanitizeUntrusted` over every input whose sanitised form is at or below the
+ * ceiling, which is the whole domain on which the two are meant to be equal.
+ */
+const TRUSTED_LINE_BREAKS = /[\r\n\t]+/g;
+const TRUSTED_CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/g;
+const TRUSTED_BIDI_CONTROLS = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const TRUSTED_FENCE_FORGERY = /BEGIN UNTRUSTED DATA|END UNTRUSTED DATA/gi;
+const FENCE_REPLACEMENT = '«redacted-marker»';
+
+/**
+ * Every injection defence `sanitizeUntrusted` applies, and none of its ceiling.
+ *
+ * Exported so the agreement assertion can compare the two directly rather than
+ * inferring the equality from emitted lines.
+ */
+export function sanitizeTrusted(value: string): string {
+  return String(value)
+    .replace(TRUSTED_LINE_BREAKS, ' ')
+    .replace(TRUSTED_CONTROL_CHARS, '')
+    .replace(TRUSTED_BIDI_CONTROLS, '')
+    .replace(TRUSTED_FENCE_FORGERY, FENCE_REPLACEMENT);
+}
+
 /** Emitted when there is genuinely nothing to say about a failure. */
 const UNSPECIFIED_ERROR = 'unspecified error';
 
@@ -374,6 +452,12 @@ export interface LogRequestOptions {
 export interface DiagnosticLogger {
   /** Sanitises, prefixes, and writes exactly one line. */
   emitDiagnostic(message: string): void;
+  /**
+   * The same, for a line the process composed from values it resolved itself:
+   * every injection defence, and no 512-character ceiling. See the trusted-text
+   * commentary above `sanitizeTrusted` for what qualifies and why.
+   */
+  emitTrusted(message: string): void;
   /** The exception-boundary emitter: context, then a safe error description. */
   emitError(context: string, error: unknown): void;
   /** Applies suppression, then writes. Returns whether a line was emitted. */
@@ -427,9 +511,17 @@ export function createDiagnosticLogger(deps: DiagnosticLoggerDeps = {}): Diagnos
     throttledClients: new Map<string, true>(),
   };
 
+  /** The shared tail: reserved-marker guard, prefix, exactly one line out. */
+  function emitLine(body: string): void {
+    write(`${LOG_PREFIX}${guardReservedMarker(body.trim() || '(empty diagnostic)')}`);
+  }
+
   function emitDiagnostic(message: string): void {
-    const sanitised = sanitizeUntrusted(String(message)).value.trim();
-    write(`${LOG_PREFIX}${guardReservedMarker(sanitised || '(empty diagnostic)')}`);
+    emitLine(sanitizeUntrusted(String(message)).value);
+  }
+
+  function emitTrusted(message: string): void {
+    emitLine(sanitizeTrusted(message));
   }
 
   function emitError(context: string, error: unknown): void {
@@ -447,7 +539,7 @@ export function createDiagnosticLogger(deps: DiagnosticLoggerDeps = {}): Diagnos
     return true;
   }
 
-  return { emitDiagnostic, emitError, logRequest };
+  return { emitDiagnostic, emitTrusted, emitError, logRequest };
 }
 
 function shouldEmitRequestLine(
@@ -540,6 +632,10 @@ const defaultLogger = createDiagnosticLogger();
 
 export function emitDiagnostic(line: string): void {
   defaultLogger.emitDiagnostic(line);
+}
+
+export function emitTrusted(line: string): void {
+  defaultLogger.emitTrusted(line);
 }
 
 export function emitError(context: string, error: unknown): void {
