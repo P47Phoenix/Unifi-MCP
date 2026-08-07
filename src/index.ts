@@ -19,6 +19,7 @@
  */
 import { pathToFileURL } from 'node:url';
 
+import { healthcheck } from './healthcheck.js';
 import { selfTest } from './selftest.js';
 import { emitDiagnostic, emitError } from './serve/log.js';
 import {
@@ -72,6 +73,7 @@ export async function main(
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   if (process.argv.includes('--selftest')) process.exit(selfTest());
+  if (process.argv.includes('--healthcheck')) process.exit(await healthcheck()); // FR-68, NFR-25
   // The production exit hook is supplied HERE because this guard is the only
   // place in `src/` permitted to end the process; the drain's hard stop calls it.
   main({}, undefined, { exit: (code) => process.exit(code) }).catch((error: unknown) => {
@@ -80,9 +82,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     // process holds a live credential and an unsanitised message leaks it.
     if (error instanceof ConfigRefusal) {
       for (const message of error.errors) emitDiagnostic(`ERROR ${message}`);
-    } else {
-      emitError('fatal', error);
-    }
+    } else emitError('fatal', error);
     process.exit(EXIT_CODES.refusal);
   });
 }

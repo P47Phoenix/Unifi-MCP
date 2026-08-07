@@ -97,11 +97,22 @@ USER node
 # 8787 is here because it is the default value of `UNIFI_HTTP_PORT`.
 EXPOSE 8787
 
-# Checks the artifact, not the configuration: an image missing its specs/ layer
-# fails, a correct image with no API key configured passes. The distinction
-# matters because a probe that failed on a missing credential would report a
-# broken image when the real problem is a missing secret.
+# Transport-aware, per FR-68/NFR-25 and §14 item 10. Under UNIFI_MCP_TRANSPORT=http
+# this asks the running PROCESS — one GET 127.0.0.1:${UNIFI_HTTP_PORT}/healthz, no
+# registry build, no credential resolution, no outbound UniFi call — because a probe
+# that re-parsed four OpenAPI specs in a second interpreter every 60 seconds repeats
+# the startup work NFR-25 forbids per probe, and because /healthz stays 200 through
+# drain while a self-test would report healthy right up to the moment the process
+# exits. Under the stdio default there is nothing bound to ask and this is still the
+# old --selftest: it checks the artifact, not the configuration, so an image missing
+# its specs/ layer fails and a correct image with no API key configured passes.
+#
+# The `CMD` below is an ARGUMENT to HEALTHCHECK, not a container command. FR-62
+# forbids a top-level CMD and states the parse rule that decides it: join
+# backslash-continued lines first, then take each line's first whitespace-delimited
+# token. Joined, this line's first token is HEALTHCHECK. A substring search for
+# `CMD` falsifies a correct Dockerfile, which is why the rule is written out.
 HEALTHCHECK --interval=1m --timeout=15s --start-period=10s --retries=3 \
-  CMD ["node", "dist/index.js", "--selftest"]
+  CMD ["node", "dist/index.js", "--healthcheck"]
 
 ENTRYPOINT ["node", "dist/index.js"]

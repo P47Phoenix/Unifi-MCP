@@ -718,6 +718,22 @@ const INVENTORY: readonly InventoryEntry[] = [
     expression: 'const effective = config.writesEnabled;',
     classification: 'diagnostic',
   },
+  //
+  // AMENDED BY US-22, and amended rather than relaxed — this assertion going
+  // red when the HTTP transport landed is the tripwire WORKING, exactly as the
+  // Wave-D carry-forward said it would for US-18.
+  //
+  // NFR-24's request line carries `writes=`, the EFFECTIVE resolved set, on
+  // every line including every rejection. The read below is hoisted once at
+  // listener construction and rendered into a log field; it decides no
+  // advertisement, gates no dispatch and is never compared against anything.
+  // `diagnostic`, therefore, and `src/serve/` still carries ZERO `enforcement`
+  // sites — the shrink-or-stay list below is untouched.
+  {
+    file: 'src/serve/http.ts',
+    expression: 'const writes = [...config.writesEnabled];',
+    classification: 'diagnostic',
+  },
 ];
 
 /** `file :: expression` — the key FR-71 mandates. Line numbers are not used. */

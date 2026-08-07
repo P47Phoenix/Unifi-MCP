@@ -113,14 +113,26 @@ export interface NormalizedError {
   retryAfterSeconds: number | null;
 }
 
+/**
+ * One closed vocabulary spanning the OUTBOUND half (the four vendor APIs,
+ * FR-24) and the INBOUND half (this server's own rejection bodies, operator
+ * contract §5.0.2), so one word means one thing across the whole product.
+ *
+ * `method_not_allowed` and `unavailable` were added for the serving transport's
+ * `405` and `503` responses. The alternative — reusing `bad_request` for a 405
+ * and `server_error` for a 503 — makes both statuses undiagnosable from the
+ * body and buys nothing.
+ */
 export type ErrorCategory =
   | 'bad_request'
   | 'unauthorized'
   | 'forbidden'
   | 'not_found'
+  | 'method_not_allowed'
   | 'rate_limit'
   | 'timeout'
   | 'payload_too_large'
+  | 'unavailable'
   | 'tls'
   | 'network'
   | 'server_error'

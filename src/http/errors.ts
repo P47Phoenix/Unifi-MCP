@@ -254,6 +254,16 @@ function recoveryHintFor(
         `Could not reach ${service}. Verify the host is reachable from this machine and that no ` +
         'firewall or VPN split-tunnel blocks it, then retry.'
       );
+    case 'method_not_allowed':
+      return (
+        `The HTTP method is not permitted for this ${service} endpoint. Re-check the action ` +
+        'definition from unifi_search_actions — the method is part of the action, not a choice.'
+      );
+    case 'unavailable':
+      return (
+        `${service} is temporarily unable to serve this request. Retry after a short delay; if it ` +
+        'persists the console or the Cloud Connector path is out of service rather than misconfigured.'
+      );
     case 'config':
       return 'Fix the named configuration setting and restart the server.';
     case 'server_error':
