@@ -13,14 +13,16 @@
  * cannot tell a mention from a use.
  *
  * The object graph is `serve/runtime.ts`, the session server
- * `serve/mcpServer.ts`, and the transport, drain and shutdown vocabulary
- * `serve/stdio.ts`. What is left is the branch, the handler installation and
- * the auto-run guard — the ONLY place in `src/` that ends it (FR-62, FR-80).
+ * `serve/mcpServer.ts`, the two transports `serve/stdio.ts` and `serve/http.ts`,
+ * and the shutdown vocabulary `serve/stdio.ts`. What is left is the branch, the
+ * handler installation and the auto-run guard — the ONLY place in `src/` that
+ * ends the process (FR-62, FR-80).
  */
 import { pathToFileURL } from 'node:url';
 
 import { healthcheck } from './healthcheck.js';
 import { selfTest } from './selftest.js';
+import { startHttp } from './serve/http.js';
 import { emitDiagnostic, emitError } from './serve/log.js';
 import {
   buildRuntimeCore,
@@ -57,16 +59,14 @@ export async function main(
   // increments for the surface taken and the other never does (FR-62).
   const surface = core.config.activeSurface;
   observer?.onTransportActivated?.(surface);
-  if (surface === 'http') {
-    // US-22 owns `startHttp`. Until it lands, selecting http is refused rather
-    // than served over stdio: a silent fall-back would serve the stdio write
-    // set on a surface the operator narrowed with UNIFI_HTTP_ALLOW_WRITES.
-    throw new ConfigRefusal([
-      'UNIFI_MCP_TRANSPORT=http is not available in this build. The HTTP serving ' +
-        'transport is still being assembled; unset the variable to serve over stdio.',
-    ]);
-  }
-  const serving = await startStdio(core, observer, servingDeps);
+  // A two-arm selection, never a fall-back: an unrecognised value was already
+  // refused by `buildRuntimeCore`, so these arms are the whole surface set. A
+  // fall-back to stdio would serve the stdio write set on a surface the
+  // operator narrowed with UNIFI_HTTP_ALLOW_WRITES.
+  const serving =
+    surface === 'http'
+      ? await startHttp(core, observer, servingDeps)
+      : await startStdio(core, observer, servingDeps);
   shutdown.publish(serving, core.config.serving.shutdownDeadlineMs);
   return serving;
 }

@@ -636,27 +636,43 @@ describe('the spawned harness — the entrypoint under observation (FR-62, FR-75
     }
   });
 
-  test('A3 (http): the other surface is counted, and stdio is not', async () => {
+  test('A3 (http): the other surface is counted, is bound, and stdio is not', async () => {
     // The counter is read at `main`'s branch, which fires BEFORE the surface is
-    // served — so this assertion is available now and is unchanged when US-22
-    // replaces the temporary refusal with a real listener. What changes then is
-    // the exit code and the message, not the counter.
+    // served. This criterion was written while `main()` still refused
+    // `UNIFI_MCP_TRANSPORT=http` with a placeholder — the note it carried then
+    // said the exit code and the message would change once US-22's listener was
+    // wired in, and that the COUNTER would not. Both halves held: the two
+    // transport-activation assertions below are byte-identical to what they
+    // were, and only the trailing exit-code/message pair moved.
+    //
+    // `listen` is now asserted at 1 rather than 0. That is the strictly stronger
+    // claim: 0 was satisfiable by a process that refused before reaching the
+    // branch, whereas 1 requires the branch to have been taken AND a listener to
+    // have bound on it — which is what makes FR-73's "no listener was opened"
+    // assertion on the refusal path (below) non-vacuous. `UNIFI_HTTP_PORT=0`
+    // keeps the child off the fixed 8787 so a concurrent suite cannot collide.
     const server = spawnServeEntry({
       env: {
         UNIFI_API_KEY: `SENTINEL-CLOUD-KEY-${'2'.repeat(16)}`,
         UNIFI_MCP_TRANSPORT: 'http',
         UNIFI_HTTP_TOKEN: INBOUND_TOKEN,
+        UNIFI_HTTP_PORT: '0',
       },
+      after: 'exit',
     });
     try {
       const counts = await server.counters();
       assert.equal(counts.transportActivated.http, 1);
       assert.equal(counts.transportActivated.stdio, 0);
-      assert.equal(counts.listen, 0, 'nothing may bind while the HTTP transport is unbuilt');
+      assert.equal(counts.listen, 1, 'the http surface must bind exactly one listener');
+      assert.equal(counts.listenAddresses.length, 1);
+      assert.ok(
+        (counts.listenAddresses[0]?.port ?? 0) > 0,
+        'UNIFI_HTTP_PORT=0 must report the OS-assigned port, not the configured 0',
+      );
 
       const exit = await server.exit();
-      assert.equal(exit.code, 1);
-      assert.match(server.stderr(), /unifi-mcp: ERROR /);
+      assert.equal(exit.code, 0, server.stderr());
     } finally {
       await server.stop();
     }
