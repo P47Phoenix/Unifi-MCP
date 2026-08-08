@@ -78,12 +78,28 @@
  * is why identifier entropy, the TTL and eviction are security controls here
  * and not resource hygiene.
  *
- * ## What this module does NOT own
+ * ## The ordered drain (architecture §3.2, FR-70, NFR-27)
  *
- * The ordered drain sequence, the pre-drain hold, the in-flight wait, the
- * deadline and the exit-code vocabulary are US-24's. What is here is the
- * pipeline STEP the drain gate plugs into — step 12 — and `terminateSession`,
- * the single per-session close path US-24's step 7 calls for each live session.
+ * `buildHandle()` below implements the eleven-step sequence in full: arm the
+ * deadline, mark `draining`, hold the listener open for `PREDRAIN_HOLD_MS`
+ * answering `503`, stop dispatch, `close()` the listener, `beginDrain()` the
+ * runtime, stop the TTL sweep, await the in-flight HANDLER promises we maintain
+ * ourselves, terminate every session in parallel under a per-session budget,
+ * `closeAllConnections()`, `close()` the runtime, exit `0` — with a hard stop
+ * to exit `75` on deadline expiry at any point.
+ *
+ * **RECORDED DEVIATION from architecture §9.4's import list for this module.**
+ * `EXIT_CODES` and `DRAIN_REFUSAL_MESSAGE` are imported from `./stdio.js`, so
+ * this file's import set is §9.4's `{guard, health, log, mcpServer, runtime}`
+ * plus `stdio`. The carry-forward register's instruction is to lift both into a
+ * transport-neutral `src/serve/signals.ts` — which is right, and is NOT done
+ * here because that requires editing `stdio.ts` and `src/index.ts`, neither of
+ * which is in this story's file scope. The alternative available inside the
+ * scope was a SECOND copy of a closed exit-code table and a wire string, which
+ * is precisely the duplicate-primitive failure this round already paid for once
+ * (defect D-03). One import is the smaller debt; `src/index.ts` already reaches
+ * into `stdio.ts` for the same vocabulary on behalf of BOTH transports today.
+ * Owner: the next story that may hold `http.ts`, `stdio.ts` and `index.ts`.
  */
 import { randomBytes } from 'node:crypto';
 import {
@@ -138,6 +154,7 @@ import {
 } from './log.js';
 import { createMcpServer } from './mcpServer.js';
 import {
+  PREDRAIN_HOLD_MS,
   resolveRegistry,
   type DrainReason,
   type Runtime,
@@ -146,7 +163,9 @@ import {
   type ServingDeps,
   type ServingObserver,
   type Surface,
+  type ToolHandler,
 } from './runtime.js';
+import { DRAIN_REFUSAL_MESSAGE, EXIT_CODES } from './stdio.js';
 
 // ---------------------------------------------------------------------------
 // Fixed constants (architecture §14 item 13: constants, not variables, because
@@ -217,16 +236,145 @@ const SESSION_SWEEP_DIVISOR = 4;
 const SESSION_SWEEP_CEILING_MS = 30_000;
 
 /**
- * What a caller arriving after the drain began is told (contract §5.14).
+ * Drain step 7's per-session teardown budget (architecture §3.2 step 7).
  *
- * Deliberately a SECOND COPY of `stdio.ts`'s `DRAIN_REFUSAL_MESSAGE` rather
- * than an import: architecture §9.4 makes an HTTP surface importing the stdio
- * module the wrong shape, and US-24 lifts the shared vocabulary into a
- * transport-neutral module when it lands. Recorded here so the duplication is a
- * known pinned pair rather than an unowned one.
+ * Step 7 is PARALLEL and each session is raced against this. Both halves are
+ * required and neither is sufficient alone. `transport.send()` is not free of
+ * backpressure — the SDK's own comment records `close()` running *"while the
+ * event store write above was awaiting"* — so a client that opened an SSE
+ * stream and stopped reading applies TCP backpressure, the enqueue never
+ * resolves, and under a sequential unbounded loop that ONE session stalls the
+ * drain so the other 31 are never sent a terminal frame and never closed. Every
+ * drain in the presence of one slow reader would then be a hard stop.
+ *
+ * 1 000 ms is generous for a few-hundred-byte frame, and it enters the §3.4
+ * budget derivation below as a named term rather than as slack.
  */
-const DRAIN_MESSAGE =
-  'The server is shutting down and is not accepting new requests. Retry against a new instance.';
+export const SESSION_TEARDOWN_BUDGET_MS = 1_000;
+
+/**
+ * The outbound residue term of the §3.4 derivation: `connectorTimeoutMs`.
+ *
+ * **A MAXIMUM OVER FIVE MUTUALLY EXCLUSIVE STATES, NOT A SUM.** An action
+ * caught by the drain is in exactly one of them:
+ *
+ *   1. resolving credentials      — abandoned at step 4 ⇒ ≈ 0 s
+ *   2. queued for a rate-limit token — abandoned at step 4 ⇒ ≈ 0 s
+ *   3. sleeping in a retry backoff   — abandoned at step 4 ⇒ ≈ 0 s
+ *   4. in flight under the per-attempt deadline ⇒ `connectorTimeoutMs`
+ *   5. between states ⇒ negligible
+ *
+ * `max(0, 0, 0, 25 000, 0) = 25 000`. Summing them instead yields ~136 s and no
+ * honest deadline exists at that figure — which is exactly why step 4's
+ * abandonment, rather than a narrowed timeout, is the mechanism.
+ */
+export function outboundResidueMs(connectorTimeoutMs: number): number {
+  return Math.max(0, 0, 0, connectorTimeoutMs, 0);
+}
+
+/**
+ * The whole of FR-70/NFR-27's 35 000 ms, derived rather than asserted.
+ *
+ * `pre-drain hold 5 000` + `outbound residue 25 000 (a max, not a sum)` +
+ * `parallel session teardown ≤ 1 000` ≈ 31 000, rounded up to
+ * `UNIFI_HTTP_SHUTDOWN_DEADLINE_MS`'s default of 35 000 with ≈ 4 s of margin.
+ *
+ * Exported so this story's tests assert the DERIVATION and not merely the
+ * literal — a test that only checks `=== 35_000` passes against a number picked
+ * by feel. **The README half of this criterion is US-05's, solely** (sequencing
+ * decision D-11): both 35 and the 50-second minimum orchestrator grace period
+ * are stated there and enforced by US-30's source scan. If this function ever
+ * produces a figure above the configured deadline, that is a change to raise
+ * with US-05 and US-30 — never a README edit made from this module.
+ */
+export function shutdownBudgetMs(connectorTimeoutMs: number): number {
+  return PREDRAIN_HOLD_MS + outboundResidueMs(connectorTimeoutMs) + SESSION_TEARDOWN_BUDGET_MS;
+}
+
+/**
+ * The HTTP drain, in order, as reported through `ServingObserver.onDrainStep`.
+ *
+ * This is the observable form of the state machine on EVERY CI leg, Windows
+ * included: `drain()` is idempotent and directly callable, so the whole
+ * sequence is asserted with no signal at all (MECH-SIGNAL, test strategy §12).
+ * A green Windows leg asserts this state machine and never the shutdown
+ * guarantee — Windows is a development and stdio platform and is not a
+ * supported HTTP deployment target (NFR-27, owner decision OQ-18).
+ *
+ * The stdio subset is `STDIO_DRAIN_STEPS`; the four steps that appear only
+ * here — `predrain-hold`, `close-listener`, `close-connections` and the
+ * listener-shaped half of `stop-dispatch` — are exactly the ones stdio cannot
+ * have, because it binds nothing and serves one session over a pipe it does not
+ * own.
+ */
+export const HTTP_DRAIN_STEPS = [
+  'arm-deadline',
+  'not-ready',
+  'predrain-hold',
+  'stop-dispatch',
+  'close-listener',
+  'begin-drain',
+  'stop-sweep',
+  'await-in-flight',
+  'close-sessions',
+  'close-connections',
+  'close-runtime',
+  'exit-code',
+] as const;
+
+/** Emitted instead of `exit-code` when the deadline expired first. */
+export const HTTP_HARD_STOP_STEP = 'hard-stop';
+
+/**
+ * A cancellable timer, so the drain's three timers are one injectable seam.
+ *
+ * Node 20 has no `mock.module`, so this is a default parameter like every other
+ * seam in this round. It exists because two of the three durations are FIXED
+ * CONSTANTS — the 5 000 ms pre-drain hold and the 1 000 ms per-session budget —
+ * which no environment variable can lower for a test, since FR-63 closes the
+ * `UNIFI_HTTP_*` family. Without this seam every drain assertion would pay five
+ * real seconds and the deadline path would be unassertable at all.
+ */
+export interface DrainTimer {
+  /** Cancels the timer. Idempotent. */
+  clear(): void;
+  /** Releases its claim on process lifetime, without cancelling it. */
+  unref(): void;
+}
+
+/** Which of the drain's three timers is being armed. Never read in production. */
+export type DrainTimerKind = 'predrain' | 'deadline' | 'session';
+
+export type DrainTimerFactory = (
+  onFire: () => void,
+  ms: number,
+  kind: DrainTimerKind,
+) => DrainTimer;
+
+/** The production factory. `kind` is inert here; it exists for the seam's fakes. */
+const createDrainTimer: DrainTimerFactory = (onFire, ms) => {
+  const timer = setTimeout(onFire, ms);
+  return {
+    clear: () => clearTimeout(timer),
+    unref: () => void timer.unref?.(),
+  };
+};
+
+/**
+ * What a caller arriving after the drain began is told (contract §5.14), and
+ * the text of the §3.4.1 terminal frame.
+ *
+ * **The second copy US-23 pinned here is now COLLAPSED into an import**, which
+ * is the D-03 lesson applied: two copies of one wire string is a drift hazard
+ * whose first symptom is an operator grepping for one message and finding half
+ * their sessions. The transport-neutral `src/serve/signals.ts` the carry-forward
+ * register names is NOT created here — this story's file scope is this file and
+ * its test — so the shared vocabulary is imported from `stdio.ts` where it
+ * already lives, exactly as `src/index.ts` already imports its shutdown
+ * vocabulary from there for BOTH transports. See the drain's own header note
+ * for the recorded §9.4 deviation and its owner.
+ */
+const DRAIN_MESSAGE = DRAIN_REFUSAL_MESSAGE;
 
 /**
  * One fixed sentence for an evicted identifier, an expired one, and a
@@ -541,6 +689,19 @@ export interface HttpServingDeps extends ServingDeps {
    * claim on process lifetime that production does not give it.
    */
   createSweepInterval?: (onTick: () => void, intervalMs: number) => NodeJS.Timeout;
+  /**
+   * The drain's three timers — the pre-drain hold, the deadline, and step 7's
+   * per-session budget. Defaults to `setTimeout`.
+   *
+   * Two of the three durations are FIXED CONSTANTS that FR-63's closed variable
+   * family means no environment can lower, so without this seam a single drain
+   * assertion costs five real seconds and the 35 000 ms deadline path costs
+   * thirty-five. A fake here also makes the fast-forward PROVABLE: the test
+   * reads back the duration each timer was armed with and fires the one it
+   * names, so a run that reached the hard stop did so because the deadline
+   * logic ran, not because the test happened not to crash.
+   */
+  setDrainTimer?: DrainTimerFactory;
 }
 
 /**
@@ -557,6 +718,15 @@ export interface HttpServing extends Serving {
   sweepIdleSessions(nowMs: number): Promise<number>;
   bounds(): ResolvedInboundBounds;
   retainedRequestBuffers(): number;
+  /**
+   * Whether `httpServer.close()`'s callback has fired (FR-70 step 2).
+   *
+   * The server-side half of the terminal-frame criterion, and it exists as an
+   * accessor precisely BECAUSE the drain does not gate on it: an assertion
+   * cannot read a callback the implementation deliberately ignores unless the
+   * implementation records it.
+   */
+  listenerClosed(): boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +1039,24 @@ interface SessionEntry {
   openStreams: number;
   /** JSON-RPC request ids this session has not answered, for the terminal frame. */
   readonly outstanding: Set<RequestId>;
+  /**
+   * THE TOOL HANDLERS' OWN PROMISES, for drain step 6 (architecture §4.1).
+   *
+   * **Never the promise `transport.handleRequest()` returns, and the difference
+   * is not stylistic.** In JSON response mode that promise is settled only by
+   * the transport's `resolveJson`, which the JSON-mode cleanup path never
+   * calls — so it stays pending for the life of the process and a drain written
+   * against it deadlocks the instant `enableJsonResponse` is ever turned on,
+   * taking the deadline and the hard stop with it. The set below is maintained
+   * by this module, in `openSession`'s handler wrapper, and is the only thing
+   * step 6 awaits.
+   *
+   * Per SESSION rather than per process, per §4.1. A handler whose entry has
+   * already left the registry — a transport that closed underneath us, seen by
+   * `onSessionGone` — is dropped from step 6's union, which is correct: its
+   * session is gone and there is nothing left to deliver its result on.
+   */
+  readonly inFlight: Set<Promise<unknown>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +1136,26 @@ export async function startHttp(
   let retainedBuffers = 0;
   /** The last `/readyz` phase a line was emitted for, so a transition always logs. */
   let lastLoggedReadyzPhase: string | null = null;
+
+  /**
+   * The SECOND layer of drain step 2b's dispatch stop, at the tool-handler
+   * boundary (architecture §3.2 step 2b).
+   *
+   * The first layer is the request pipeline's step 12, which refuses every MCP
+   * method with the `503` drain body from the moment `readiness.phase` becomes
+   * `'draining'`. This flag closes the residual window between the two: a
+   * request that PASSED step 12 before the mark but has not yet reached a
+   * handler. Checked at handler ENTRY only, and deliberately never re-checked
+   * afterwards — a tool call already inside its handler when the drain began is
+   * exactly what step 6 promises to let finish, and rejecting it here would
+   * break FR-70's *"a client with an outstanding request receives a complete
+   * response"* while appearing to strengthen the drain.
+   */
+  let dispatchStopped = false;
+
+  const drainTimer = deps.setDrainTimer ?? createDrainTimer;
+  const setExitCode = deps.setExitCode ?? ((code: number): void => void (process.exitCode = code));
+  const exitProcess = deps.exit ?? setExitCode;
 
   // -------------------------------------------------------------------------
   // The pipeline
@@ -1494,6 +1702,44 @@ export async function startHttp(
     // and can, in principle, fire during `connect()`.
     let entry: SessionEntry | null = null;
 
+    /**
+     * This session's in-flight set, live from before the entry exists.
+     *
+     * Held in its own binding rather than reached through `entry`, because a
+     * handler dispatched during `connect()` — or during the `initialize` that
+     * creates the entry — would otherwise find `entry === null` and its promise
+     * would never join the set drain step 6 awaits. The entry below takes THIS
+     * object, so the two are the same set and not two.
+     */
+    const inFlight = new Set<Promise<unknown>>();
+
+    /**
+     * The tracked handler map. **This is the mechanism of drain step 6.**
+     *
+     * Every tool call the session makes is wrapped so that the HANDLER's own
+     * promise — the one that settles when the tool's work is genuinely done —
+     * joins `inFlight`. The alternative an implementer reaches for first is
+     * `await transport.handleRequest(...)`'s promise in `dispatch()`, and it is
+     * a trap: in JSON response mode the SDK settles that promise only through
+     * `resolveJson`, which its own JSON-mode cleanup never calls, so the drain
+     * would wait forever on a request whose handler finished long ago.
+     * `enableJsonResponse` is left at its default precisely so the trap is not
+     * armed, but a drain that depends on an option staying off is not a drain.
+     */
+    const handlers: Record<string, ToolHandler> = {};
+    for (const [name, handler] of Object.entries(core.handlers)) {
+      handlers[name] = async (args: Record<string, unknown>) => {
+        if (dispatchStopped) throw new Error(DRAIN_MESSAGE);
+        const call = handler(args);
+        inFlight.add(call);
+        try {
+          return await call;
+        } finally {
+          inFlight.delete(call);
+        }
+      };
+    }
+
     const transport = createTransport({
       ...options.transportOptionsFor(id),
       // PROMOTION. `sdk-facts` §B.3: this fires INSIDE POST handling, after an
@@ -1522,7 +1768,10 @@ export async function startHttp(
       config: core.config,
       credentials: core.credentials,
       client: core.client,
-      handlers: core.handlers,
+      // The tracked map, never `core.handlers`. Substituting the untracked one
+      // here is the single-line change that empties drain step 6's set while
+      // leaving every other assertion in this file green.
+      handlers,
       auth: core.auth,
       activeSurface: core.activeSurface,
       ready: core.ready,
@@ -1564,6 +1813,7 @@ export async function startHttp(
       inFlightRequests: 0,
       openStreams: 0,
       outstanding: new Set<RequestId>(),
+      inFlight,
     };
     sessions.set(key, entry);
     return entry;
@@ -1775,48 +2025,270 @@ export async function startHttp(
 
   function buildHandle(): HttpServing {
     let outcome: Promise<'clean' | 'deadline'> | null = null;
+    let deadlineTimer: DrainTimer | null = null;
+    /**
+     * Whether `httpServer.close()`'s callback has fired. **EVIDENCE, NOT THE
+     * GATE** (architecture §3.2 step 3, FR-70 step 2).
+     *
+     * Awaiting this callback is the obvious implementation and it is wrong: it
+     * does not fire until every response has ended AND every keep-alive socket
+     * has expired its `keepAliveTimeout`. An idle keep-alive connection with no
+     * in-flight request would therefore hold the drain for the whole
+     * `keepAliveTimeout`, and an open SSE stream — which never ends on its own —
+     * would hold it until the deadline, turning every drain with one connected
+     * client into a hard stop and an exit 75. So the drain proceeds past
+     * `close()` immediately and this flag is read only by the assertion that
+     * the listener really did stop accepting.
+     */
+    let listenerClosed = false;
 
-    const teardown = async (): Promise<void> => {
-      observer?.onDrainStep?.('not-ready');
-      readiness.phase = 'draining';
-      observer?.onDrainStep?.('begin-drain');
+    const step = (name: string): void => observer?.onDrainStep?.(name);
+
+    /**
+     * Normative (architecture §3.2): **every awaited step is individually
+     * caught, logs one line, and the drain continues to the next step.**
+     *
+     * `drain()` is invoked from a signal handler whose result nobody awaits, so
+     * a rejection escaping one step used to skip every step after it: no
+     * terminal frames, no `closeAllConnections()`, no `agent.destroy()`, and an
+     * exit code of 1 — the drain failing in the one way this design has no
+     * diagnostic for, being neither `clean` nor `deadline`. The emitter is the
+     * request logger's, so the line goes wherever this listener's diagnostics
+     * go rather than to a process-global stream.
+     */
+    const guarded = async (label: string, run: () => unknown): Promise<void> => {
       try {
-        core.beginDrain();
-      } catch {
-        /* the drain continues; every step is individually guarded */
-      }
-
-      // The periodic sweep stops before the listener does: from here on the
-      // drain gate refuses every MCP method, so nothing can become idle that
-      // the explicit session close below will not reach anyway.
-      clearInterval(sweepTimer);
-
-      observer?.onDrainStep?.('close-listener');
-      await new Promise<void>((resolve) => {
-        httpServer.close(() => resolve());
-        // The ONLY call that kills an SSE-carrying socket: `close()` and
-        // `closeIdleConnections()` both use the "not sending a request or
-        // waiting for a response" predicate, and an open SSE response is by
-        // definition not idle. US-24 owns the ordered sequence around this.
-        httpServer.closeAllConnections();
-      });
-
-      observer?.onDrainStep?.('close-sessions');
-      // Every entry, `pending` ones included: a session whose initialisation
-      // has not yet been confirmed is not invisible to the drain. US-24 owns
-      // the ordering, the per-session budget and the parallelism around this.
-      for (const key of [...sessions.keys()]) await terminateSession(key, 'drain');
-
-      observer?.onDrainStep?.('close-runtime');
-      try {
-        await core.close();
-      } catch {
-        /* teardown is best-effort by design */
+        await run();
+      } catch (error) {
+        logger.emitError(`drain ${label}`, error);
       }
     };
 
-    const drain = (_reason: DrainReason): Promise<'clean' | 'deadline'> => {
-      outcome ??= teardown().then((): 'clean' => 'clean');
+    /** One session's teardown, raced against step 7's per-session budget. */
+    const withSessionBudget = async (key: string): Promise<void> => {
+      let budget: DrainTimer | null = null;
+      const expired = new Promise<void>((resolve) => {
+        budget = drainTimer(resolve, SESSION_TEARDOWN_BUDGET_MS, 'session');
+      });
+      try {
+        await Promise.race([terminateSession(key, 'drain'), expired]);
+      } finally {
+        (budget as DrainTimer | null)?.clear();
+      }
+    };
+
+    /**
+     * The ordered sequence, steps 2 through 9 (architecture §3.2).
+     *
+     * Step 1 (arming the deadline) and step 10 (the exit code) sit in `drain`
+     * below, because they bracket the race this function is one half of.
+     */
+    const teardown = async (reason: DrainReason): Promise<void> => {
+      // -- Step 2: the not-ready mark. DISPATCH CLOSES HERE. -----------------
+      //
+      // Both layers flip together and that is deliberate. The pipeline's step
+      // 12 begins refusing every MCP method with the `503` drain body from this
+      // instant, and the handler-entry flag closes the residual window behind
+      // it. The architecture's own table lists 2b after 2a while defining it as
+      // effective "from the moment step 2 runs"; the observable `stop-dispatch`
+      // step is therefore emitted in the table's position, below, while the
+      // mechanism takes effect here, where the table says it must.
+      step('not-ready');
+      readiness.phase = 'draining';
+      dispatchStopped = true;
+
+      // -- Step 2a: the pre-drain hold, WITH THE LISTENER STILL OPEN --------
+      //
+      // The single most counter-intuitive step in the sequence, and the one a
+      // reviewer will want to delete. SIGTERM and endpoint withdrawal are
+      // concurrent and INDEPENDENT: kube-proxy, an ingress controller and any
+      // client-side load balancer keep routing NEW connections to a terminating
+      // pod for seconds after the signal. Closing the listener at t0 refuses
+      // them at the kernel, where no request is ever parsed and no log line can
+      // be written — so every routine rolling deploy drops client connections
+      // and the operator sees client-side errors correlated with deploys and
+      // nothing whatsoever in `kubectl logs`. Holding the listener open for a
+      // bounded window converts an unloggable connection refusal into a logged
+      // `503` carrying `reject_reason=draining`, which is the token that lets
+      // an operator tell a rolling deploy from a capacity incident — two
+      // conditions with opposite remedies.
+      //
+      // Skipped by `dispose()`, which is teardown and has no endpoints to
+      // withdraw, and by `'startup-failure'`, where the process never became
+      // ready so nothing was ever routed to it.
+      if (reason !== 'disposal' && reason !== 'startup-failure') {
+        step('predrain-hold');
+        await new Promise<void>((resolve) => {
+          drainTimer(resolve, PREDRAIN_HOLD_MS, 'predrain');
+        });
+      }
+
+      // -- Step 2b: dispatch stop (observable; effective at step 2) ---------
+      step('stop-dispatch');
+
+      // -- Step 3: close the listener --------------------------------------
+      step('close-listener');
+      await guarded('close-listener', () => {
+        httpServer.close(() => {
+          listenerClosed = true;
+        });
+      });
+
+      // -- Step 4: the runtime's outbound drain -----------------------------
+      //
+      // THE STEP THAT MAKES THE DEADLINE DERIVABLE. `core.beginDrain()` reaches
+      // `client.beginDrain()` and `limiter.close()`: queued rate-limit waiters
+      // fail immediately with the existing structured `rate_limit` error rather
+      // than extending the drain, an in-progress `Retry-After` backoff is
+      // ABANDONED rather than awaited, and an action still inside
+      // `credentials.resolveFor()` is FAILED rather than waited on. Without it
+      // the residue is three attempts at 25 s separated by two honoured 30 s
+      // sleeps — 137 s plus an unbounded queue term — and no honest deadline
+      // exists at all.
+      //
+      // NOT awaited, and it does not abort in-flight HTTP attempts: step 6
+      // promises those the chance to finish under their existing per-attempt
+      // deadline, and aborting here would truncate the very request the drain
+      // exists to complete.
+      step('begin-drain');
+      await guarded('begin-drain', () => core.beginDrain());
+
+      // -- Step 5: stop the TTL sweep ---------------------------------------
+      //
+      // Here rather than at the top of teardown, per the architecture's step
+      // numbering: the dispatch stop of 2b has already assumed the sweep's
+      // refusal duty, and step 7 below reaches every entry the sweep would
+      // have.
+      step('stop-sweep');
+      clearInterval(sweepTimer);
+
+      // -- Step 6: await the in-flight HANDLER promises ---------------------
+      //
+      // The set is final because 2b closed dispatch, so this snapshot cannot
+      // grow underneath the drain. `allSettled`, not `all`: a handler that
+      // rejects is a completed handler.
+      step('await-in-flight');
+      const pending: Promise<unknown>[] = [];
+      for (const entry of sessions.values()) pending.push(...entry.inFlight);
+      await Promise.allSettled(pending);
+      // The SDK sends a tool result AFTER its callback resolves, so closing the
+      // session on this same tick would truncate the very response the step
+      // above waited for. One macrotask is enough: the send is initiated from
+      // the microtask chain the handler ended.
+      await new Promise((resolve) => setImmediate(resolve));
+
+      // -- Step 7: terminate every session, IN PARALLEL, each bounded -------
+      //
+      // `pending` entries included — a session whose `onsessioninitialized` has
+      // not fired is not invisible to the drain. `terminateSession` is US-23's
+      // single per-session close path and sends the §3.4.1 terminal frame
+      // before closing, which is what stops a client seeing a silently
+      // truncated stream.
+      step('close-sessions');
+      await Promise.allSettled([...sessions.keys()].map((key) => withSessionBudget(key)));
+
+      // -- Step 8: destroy the sockets --------------------------------------
+      //
+      // THE ONLY CALL THAT KILLS AN SSE-CARRYING SOCKET, and it runs AFTER the
+      // terminal frames of step 7 so the frame is on the wire before the socket
+      // dies. `close()` and `closeIdleConnections()` both use the "not sending
+      // a request or waiting for a response" predicate, and an open SSE
+      // response is BY DEFINITION not idle, so neither touches it.
+      //
+      // **`closeIdleConnections()` IS DELIBERATELY NOT CALLED ANYWHERE IN THIS
+      // MODULE.** Its absence is a decision, not an omission: Node ≥ 19 already
+      // reaps idle keep-alive sockets inside `close()` itself, so the call is
+      // REDUNDANT for the only case it covers, and USELESS for the case that
+      // actually matters here. A test asserts the literal absence, because an
+      // absence that is only true by omission is one well-meaning
+      // belt-and-braces commit away from being false.
+      step('close-connections');
+      await guarded('close-connections', () => httpServer.closeAllConnections());
+
+      // -- Step 9: release the runtime --------------------------------------
+      //
+      // `core.close()` → `client.close()`: abort every remaining in-flight
+      // controller, `agent.destroy()` every cached outbound keep-alive agent,
+      // clear the timer sets. Without the agent destruction, exit 0 BY NATURAL
+      // DRAIN is unreachable — pooled `keepAlive: true` sockets are `ref`'d
+      // handles and hold the event loop open forever.
+      step('close-runtime');
+      await guarded('close-runtime', () => core.close());
+    };
+
+    /**
+     * Idempotent and directly callable — which is what lets the whole state
+     * machine be asserted on `windows-latest` with no signal at all.
+     */
+    const drain = (reason: DrainReason): Promise<'clean' | 'deadline'> => {
+      outcome ??= (async (): Promise<'clean' | 'deadline'> => {
+        let expire = (): void => undefined;
+        const expired = new Promise<'deadline'>((resolve) => {
+          expire = (): void => resolve('deadline');
+        });
+
+        // -- Step 1: arm the deadline, REF'D --------------------------------
+        //
+        // Before the mark, so the bound covers step 2a as well as everything
+        // after it. Ref'd: it must fire even when the drain is idle-waiting on
+        // promises, which is the state it exists to bound.
+        step('arm-deadline');
+        deadlineTimer = drainTimer(expire, config.serving.shutdownDeadlineMs, 'deadline');
+
+        const finished = teardown(reason).then((): 'clean' => 'clean');
+        const result = await Promise.race([finished, expired]);
+
+        if (result === 'deadline') {
+          // -- Step H: the hard stop ---------------------------------------
+          //
+          // NFR-27's "never SIGKILLed" is otherwise a hope rather than a
+          // guarantee: something is still holding the loop and only the
+          // process's own exit ends it. Sockets destroyed, runtime released
+          // fire-and-forget, exit 75 — and 75 means THE DRAIN DEADLINE EXPIRED
+          // and nothing else, which is why a second signal escalates to 143 or
+          // 130 instead of reusing it.
+          step(HTTP_HARD_STOP_STEP);
+          try {
+            httpServer.closeAllConnections();
+          } catch {
+            /* the listener is already gone; the exit below is what matters */
+          }
+          void Promise.resolve(core.close()).catch(() => undefined);
+          if (reason !== 'disposal') {
+            setExitCode(EXIT_CODES.deadline);
+            exitProcess(EXIT_CODES.deadline);
+          }
+          return 'deadline';
+        }
+
+        // -- Step 10: the exit code ------------------------------------------
+        //
+        // `dispose()` is teardown only: it never touches the exit code and
+        // never exits, so it never reaches this branch at all.
+        if (reason !== 'disposal') {
+          setExitCode(reason === 'crash' ? EXIT_CODES.crash : EXIT_CODES.clean);
+          step('exit-code');
+        }
+
+        // The timer's disposition, and it is the subtle half. In PRODUCTION it
+        // is UN-REF'D rather than cleared: an un-ref'd timer does not hold the
+        // loop open, but it still fires if the loop is alive for some other
+        // reason. So if everything was released the process exits 0 by natural
+        // drain — which is exactly what proves the agents were destroyed — and
+        // if something leaked, the timer fires and the hard stop REPORTS it as
+        // exit 75 rather than leaving a silent hang. Clearing it unconditionally
+        // would convert a leak into an indefinite hang with no diagnostic.
+        //
+        // BUT a test process's loop is always alive, so an un-ref'd timer there
+        // always fires — and its callback is the hard stop, which exits with
+        // `EXIT_CODES.deadline`. That arms a bomb in every in-process drain
+        // test, killing the file mid-suite with no diagnostic, and lowering the
+        // deadline for speed makes it fire SOONER. The condition is therefore
+        // on the INJECTED HOOK, never on any `NODE_ENV` branch.
+        if (deps.exit !== undefined || reason === 'disposal') deadlineTimer.clear();
+        else deadlineTimer.unref();
+        return 'clean';
+      })();
       return outcome;
     };
 
@@ -1826,9 +2298,17 @@ export async function startHttp(
       drain,
       async dispose(): Promise<void> {
         await drain('disposal');
+        // Cleared unconditionally here, whatever path armed it: `dispose()` is
+        // what a test's `after()` calls, and a live deadline timer surviving
+        // teardown is the §10.5 leak this clause exists to close.
+        if (deadlineTimer !== null) deadlineTimer.clear();
         // The registry resolution is awaited so a disposed transport leaves no
         // promise still holding a reference to the runtime.
         await resolving.catch(() => undefined);
+      },
+      /** Whether `httpServer.close()`'s callback fired. Evidence, never a gate. */
+      listenerClosed(): boolean {
+        return listenerClosed;
       },
       /**
        * RESERVATIONS, not map size (architecture §4.1, §4.3).
