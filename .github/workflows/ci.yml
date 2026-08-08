@@ -22,6 +22,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # NFR-28: the `sdk-canary` job below reports SDK drift BETWEEN pull requests,
+  # not only alongside them. A canary that only runs when someone happens to
+  # open a PR reports a vendor release whenever the next PR lands, which on a
+  # quiet week is no report at all. Off the hour deliberately — every other
+  # weekly cron in the world fires at :00.
+  schedule:
+    - cron: '17 4 * * 1'
   workflow_dispatch:
 
 concurrency:
@@ -143,37 +150,76 @@ jobs:
 
           cat tools-list.json
 
-          # Assert the expected tool names are present. The hybrid search+execute
-          # surface (ADR-02) is five promoted read tools, one search tool and two
-          # execution tools — separate because NFR-01 requires it.
+          # FR-74, §14 item 14: the expected surface is COMPUTED from the build
+          # under test, never enumerated here. `loadConfig` is handed the same
+          # four variables the Inspector handed the server, so `advertisedTools`
+          # returns exactly the set that process should advertise — this is a
+          # real `tools/list` frame compared against the registry, in BOTH
+          # directions, rather than against a list someone maintains by hand.
+          #
+          # What this replaces: an eight-name literal array and a `> 12` cap.
+          # Both were correct on the day they were written and neither had any
+          # way of noticing a ninth tool, so the surface could grow past FR-18's
+          # cap with the check still green.
           node --input-type=module -e '
             import { readFileSync } from "node:fs";
-            const expected = [
-              "unifi_list_sites",
-              "unifi_list_consoles",
-              "unifi_list_devices",
-              "unifi_list_clients",
-              "unifi_list_cameras",
-              "unifi_search_actions",
-              "unifi_execute_action",
-              "unifi_execute_write_action",
-            ];
+            import { resolve } from "node:path";
+            import { pathToFileURL } from "node:url";
+            const load = (p) => import(pathToFileURL(resolve(p)).href);
+            const { loadConfig } = await load("dist/config.js");
+            const { advertisedTools, ALL_TOOLS } = await load("dist/tools/definitions.js");
+            const config = loadConfig({
+              UNIFI_API_KEY: "ci-smoke-test-placeholder-key",
+              UNIFI_CONSOLE_ID: "0000000000000000",
+              UNIFI_ENABLE_WRITES: "network,protect",
+            });
+            const expected = advertisedTools(config.enabledServices, config.writesEnabled)
+              .map((t) => t.name)
+              .sort();
             const payload = JSON.parse(readFileSync("tools-list.json", "utf8"));
-            const tools = payload.tools ?? [];
-            const names = new Set(tools.map((t) => t.name));
-            const missing = expected.filter((n) => !names.has(n));
-            if (missing.length) {
-              console.error("::error title=Missing tools::tools/list is missing: " + missing.join(", "));
-              console.error("advertised: " + [...names].join(", "));
+            const advertised = (payload.tools ?? []).map((t) => t.name).sort();
+            // Anti-vacuity: an empty computed surface would make every
+            // comparison below pass by having nothing to compare. Written as a
+            // truthiness test rather than `=== 0` on purpose — FR-74 limb 1
+            // rejects an integer literal compared against a tool-set count,
+            // and this file is in that scan is scope.
+            if (!expected.length) {
+              console.error("::error title=Vacuous check::the registry computed an empty tool surface.");
               process.exit(1);
             }
-            // FR-18 caps the advertised surface at 12 tools.
-            if (tools.length > 12) {
-              console.error("::error title=Too many tools::tools/list advertises " + tools.length + " tools; FR-18 caps it at 12.");
+            const missing = expected.filter((n) => !advertised.includes(n));
+            const unexpected = advertised.filter((n) => !expected.includes(n));
+            if (missing.length || unexpected.length) {
+              console.error("::error title=tools/list drifted from the registry::missing: " +
+                (missing.join(", ") || "(none)") + " | unexpected: " + (unexpected.join(", ") || "(none)"));
+              console.error("advertised: " + advertised.join(", "));
+              console.error("computed:   " + expected.join(", "));
               process.exit(1);
             }
-            console.log("Inspector smoke test OK: " + tools.length + " tools advertised.");
+            // FR-18 caps the advertised surface. The cap is the DECLARED tool
+            // set, read from the same module — not the literal 12 it replaces.
+            if (advertised.length > ALL_TOOLS.length) {
+              console.error("::error title=Too many tools::tools/list advertises " + advertised.length +
+                " tools; the declared surface holds " + ALL_TOOLS.length + " (FR-18).");
+              process.exit(1);
+            }
+            console.log("Inspector smoke test OK: " + advertised.length +
+              " tools advertised, equal to the surface the registry computes for this configuration.");
           '
+
+      # US-31: the HTTP analogue of the stdio smoke test above, driving the same
+      # Inspector against a real bound listener with a real `Authorization`
+      # header. POSIX legs only — the script spawns a server process, reads its
+      # bound ephemeral port off stderr and signals it on the way out, and this
+      # round's standing owner decision (OQ-18, NFR-27) makes Windows a
+      # development and stdio platform rather than an HTTP deployment target.
+      #
+      # `ci.yml` already runs on `pull_request` across the matrix, so unlike the
+      # container workflow this venue gates a merge as it stands.
+      - name: MCP Inspector CLI smoke test over HTTP
+        if: runner.os != 'Windows'
+        shell: bash
+        run: npm run inspect:cli:http
 
       - name: Upload tools/list output
         if: always() && hashFiles('tools-list.json') != ''
@@ -182,3 +228,147 @@ jobs:
           name: tools-list-${{ matrix.os }}
           path: tools-list.json
           if-no-files-found: ignore
+
+  # NFR-28 / §14 item 17. The declared RANGE is `~1.30.0`; the LOCKFILE holds
+  # whatever `npm ci` resolved on the day it was written. Those two differ, and
+  # a build that is green against the lockfile can be broken for everyone who
+  # installs from the manifest — which is the whole population that does not
+  # have this repository's `package-lock.json`.
+  #
+  # This job carries NO `continue-on-error` and belongs in the workflow's
+  # required-status set. A non-blocking floor check is precisely the defect
+  # NFR-28 was written against: it would observe the breakage and ship it.
+  sdk-floor:
+    name: sdk-floor (declared floor, blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Read out of package.json rather than written out again here, so the
+      # floor this job installs cannot drift from the one the manifest
+      # declares. `test/sdk-floor.test.ts` asserts that declared string is
+      # exactly `~1.30.0`, which is the other half of the same guarantee.
+      - name: Resolve the declared floor
+        id: floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLOOR="$(node -p "require('./package.json').dependencies['@modelcontextprotocol/sdk'].replace(/^[~^]/, '')")"
+          echo "version=${FLOOR}" >> "$GITHUB_OUTPUT"
+          echo "Declared floor: ${FLOOR}"
+
+      - name: Override the lockfile with the exact floor
+        run: npm i --no-save "@modelcontextprotocol/sdk@${{ steps.floor.outputs.version }}"
+
+      # Without this the job could silently keep testing the lockfile's version
+      # if the install ever became a no-op, which is the failure mode that
+      # makes a floor check look green and prove nothing.
+      - name: Confirm the floor is what is installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTALLED="$(node -p "require('./node_modules/@modelcontextprotocol/sdk/package.json').version")"
+          echo "Installed: ${INSTALLED}"
+          test "${INSTALLED}" = "${{ steps.floor.outputs.version }}"
+
+      - name: Build
+        run: npm run build
+
+      # The serving-transport suite: every SDK behaviour this product relies on
+      # is exercised here, so this is what the floor has to survive.
+      - name: Serving-transport suite against the floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-timeout=60000 --import tsx \
+            test/serve-*.test.ts test/runtime.test.ts test/signals.test.ts \
+            test/healthcheck.test.ts test/instruments.test.ts
+
+  # NFR-28's other half (R-16). Same steps, against `@latest`, so an SDK bump
+  # arrives as a pull request rather than as a silent production change.
+  #
+  # It carries `continue-on-error: true` and is EXCLUDED from the required-status
+  # set on purpose: a vendor release must not turn a commit red that changed
+  # nothing. The `schedule:` trigger at the top of this file is what makes it
+  # report between pull requests rather than only alongside them.
+  sdk-canary:
+    name: sdk-canary (@latest, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install the latest SDK
+        id: latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm i --no-save "@modelcontextprotocol/sdk@latest"
+          RESOLVED="$(node -p "require('./node_modules/@modelcontextprotocol/sdk/package.json').version")"
+          echo "version=${RESOLVED}" >> "$GITHUB_OUTPUT"
+          echo "Resolved @latest: ${RESOLVED}"
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: npm run build
+
+      - name: Serving-transport suite against @latest
+        id: suite
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-timeout=60000 --import tsx \
+            test/serve-*.test.ts test/runtime.test.ts test/signals.test.ts \
+            test/healthcheck.test.ts test/instruments.test.ts
+
+      # The report is the deliverable, so it is written whatever happened above.
+      - name: Report drift to the job summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          DECLARED="$(node -p "require('./package.json').dependencies['@modelcontextprotocol/sdk']")"
+          {
+            echo "### sdk-canary"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Declared range | \`${DECLARED}\` |"
+            echo "| Resolved \`@latest\` | \`${LATEST}\` |"
+            echo "| Build | \`${BUILD_OUTCOME}\` |"
+            echo "| Serving-transport suite | \`${SUITE_OUTCOME}\` |"
+            echo
+            if [ "${BUILD_OUTCOME}" = "success" ] && [ "${SUITE_OUTCOME}" = "success" ]; then
+              echo "No drift: \`@latest\` (\`${LATEST}\`) builds and passes the serving-transport suite."
+            else
+              echo "**Drift detected against \`@latest\` (\`${LATEST}\`).**"
+              echo "This job does not gate — open a pull request that raises the declared floor"
+              echo "and fixes what broke, rather than letting the bump arrive silently (NFR-28, R-16)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          LATEST: ${{ steps.latest.outputs.version }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          SUITE_OUTCOME: ${{ steps.suite.outcome }}

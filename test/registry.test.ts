@@ -197,9 +197,24 @@ describe('advertised tool surface', () => {
     assert.ok(tools.some((t) => t.name === 'unifi_execute_write_action'));
   });
 
-  test('at most 12 tools with everything enabled (FR-18)', () => {
+  test('no configuration advertises more than the declared surface (FR-18, FR-74)', () => {
+    // FR-18's cap was written here as the literal 12. A literal cannot notice a
+    // thirteenth tool being declared, so the bound that actually protects the
+    // budget is the declared surface itself: `advertisedTools` filters
+    // `ALL_TOOLS`, so the widest configuration can only ever equal it, and any
+    // configuration that exceeded it would mean the filter had started
+    // inventing tools. Computed, never enumerated (FR-74, §14 item 14).
     const tools = advertisedTools(allServices, new Set<ServiceId>(['network']));
-    assert.ok(tools.length <= 12, `advertised ${tools.length} tools`);
+    assert.ok(tools.length <= ALL_TOOLS.length, `advertised ${tools.length} tools`);
+    assert.ok(ALL_TOOLS.length > 0, 'the declared surface is empty, so this bound proves nothing');
+    // The cap is a budget, not an accident of today's surface: the token budget
+    // gate (G-3) is what enforces the cost, and FR-18's ceiling is asserted
+    // against the declared set rather than against a number kept in step by hand.
+    assert.deepEqual(
+      tools.filter((tool) => !ALL_TOOLS.includes(tool)),
+      [],
+      'advertisedTools returned a tool that is not declared in ALL_TOOLS',
+    );
   });
 
   test('disabling Protect removes the camera tool (FR-22)', () => {
@@ -246,8 +261,20 @@ describe('advertised tool surface', () => {
   });
 
   test('each promoted read tool names a sibling it could be confused with (NFR-03)', () => {
+    // The promotion predicate is `requiresService`: a promoted read tool is one
+    // that exists because a specific API is enabled (FR-22), which is exactly
+    // the set `advertisedTools` drops when that API is off. The literal 5 this
+    // replaces restated the answer instead of deriving it, so promoting a sixth
+    // tool would have turned this red for a reason unrelated to NFR-03.
     const promoted = ALL_TOOLS.filter((t) => t.name.startsWith('unifi_list_'));
-    assert.equal(promoted.length, 5);
+    assert.deepEqual(
+      promoted.map((t) => t.name).sort(),
+      ALL_TOOLS.filter((t) => t.requiresService !== undefined)
+        .map((t) => t.name)
+        .sort(),
+      'the promoted read tools are exactly the service-gated tools (FR-22)',
+    );
+    assert.ok(promoted.length > 0, 'the scan matched nothing, so it proves nothing');
     for (const tool of promoted) {
       const namesAnother = ALL_TOOLS.some(
         (other) => other.name !== tool.name && tool.description.includes(other.name),

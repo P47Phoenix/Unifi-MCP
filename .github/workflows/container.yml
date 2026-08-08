@@ -215,6 +215,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # FR-74, §14 item 14. The tool-surface assertion below compares the
+      # published image's real `tools/list` frame against the surface THIS
+      # COMMIT'S registry computes for the same environment — source against
+      # artifact, two independent things. That needs the source, so this job
+      # checks out and builds; it previously carried a seven-name Python set
+      # instead, which could not notice a tool being added or removed.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Build the registry the image is checked against
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
       # Pinned to the digest, so this tests the exact artifact that was
       # published rather than whatever a mutable tag resolves to later.
       - name: Artifact self-test
@@ -243,6 +264,30 @@ jobs:
                 -e UNIFI_LOCAL_API_KEY=ci-placeholder \
                 "$IMAGE" 2>/dev/null > /tmp/mcp.jsonl
 
+          # The expected surface is COMPUTED from this commit's registry, given
+          # the same three variables the container above was started with. The
+          # seven-name literal set this replaces (AR-13's compensating control)
+          # was a fourth copy of the tool list; the real `tools/list` frame
+          # piped into `docker run -i` above is untouched, because that frame IS
+          # the control and US-29's parity suite depends on it existing.
+          node --input-type=module -e '
+            import { writeFileSync } from "node:fs";
+            import { resolve } from "node:path";
+            import { pathToFileURL } from "node:url";
+            const load = (p) => import(pathToFileURL(resolve(p)).href);
+            const { loadConfig } = await load("dist/config.js");
+            const { advertisedTools, ALL_TOOLS } = await load("dist/tools/definitions.js");
+            const config = loadConfig({
+              UNIFI_API_KEY: "ci-placeholder",
+              UNIFI_LOCAL_HOST: "10.0.0.1",
+              UNIFI_LOCAL_API_KEY: "ci-placeholder",
+            });
+            writeFileSync("/tmp/expected-tools.json", JSON.stringify({
+              expected: advertisedTools(config.enabledServices, config.writesEnabled).map((t) => t.name),
+              declared: ALL_TOOLS.map((t) => t.name),
+            }));
+          '
+
           python3 - <<'PY'
           import json
           tools = []
@@ -253,16 +298,26 @@ jobs:
               msg = json.loads(line)
               if msg.get('id') == 2:
                   tools = [t['name'] for t in msg['result']['tools']]
-          expected = {
-              'unifi_list_consoles', 'unifi_list_sites', 'unifi_list_devices',
-              'unifi_list_clients', 'unifi_list_cameras', 'unifi_search_actions',
-              'unifi_execute_action',
-          }
+          computed = json.load(open('/tmp/expected-tools.json'))
+          expected = set(computed['expected'])
+          declared = set(computed['declared'])
+          # Anti-vacuity: an empty computed surface would make both comparisons
+          # below pass by having nothing to compare.
+          assert expected, 'the registry computed an empty tool surface'
           missing = expected - set(tools)
+          unexpected = set(tools) - expected
           assert not missing, f'missing tools: {missing}'
+          assert not unexpected, f'tools the registry does not advertise: {unexpected}'
           # FR-44: the write tool must be absent without UNIFI_ENABLE_WRITES.
-          assert 'unifi_execute_write_action' not in tools, 'write tool exposed by default'
-          print(f'OK: {len(tools)} tools, read-only default holds')
+          # Derived from the registry's own promotion rule — the write tool is
+          # the declared tool that this configuration does NOT advertise —
+          # rather than named here a second time.
+          withheld = declared - expected
+          assert withheld, 'no tool is withheld, so the read-only default is not being exercised'
+          for name in withheld:
+              assert name not in tools, f'{name} exposed by default'
+          print(f'OK: {len(tools)} tools, equal to the computed surface; '
+                f'{len(withheld)} withheld, read-only default holds')
           PY
 
       - name: Summary
