@@ -63,13 +63,27 @@
  *     a stranger lock out the legitimate client, holding the correct secret,
  *     with twenty-one garbage requests a minute.
  *
+ * ## The session registry is OURS IN FULL (architecture §4)
+ *
+ * The SDK supplies **no session registry, no map, no store, no TTL, no cap, no
+ * eviction and no forced-termination API at any layer**. A transport instance
+ * *is* one session and its entire session state is the public field
+ * `sessionId?: string`; the internal stream maps are private with no getter.
+ * The map, the reservation counter, the sweep, the eviction path and the
+ * identifier generator below are therefore written from scratch rather than
+ * configured on top of an SDK primitive — there is none to lean on.
+ *
+ * And a session is a BEARER-EQUIVALENT CREDENTIAL (NFR-24): in stateful mode
+ * possession of an `Mcp-Session-Id` is sufficient to continue a session, which
+ * is why identifier entropy, the TTL and eviction are security controls here
+ * and not resource hygiene.
+ *
  * ## What this module does NOT own
  *
- * The session cap, the idle TTL, the eviction path and the identifier
- * generator are US-23's; the ordered drain sequence, the pre-drain hold, the
- * per-session terminal frames and the exit-code vocabulary are US-24's. What is
- * here is the pipeline STEP each of them plugs into — step 11 and step 12 — and
- * a teardown honest enough to release every handle a test opens.
+ * The ordered drain sequence, the pre-drain hold, the in-flight wait, the
+ * deadline and the exit-code vocabulary are US-24's. What is here is the
+ * pipeline STEP the drain gate plugs into — step 12 — and `terminateSession`,
+ * the single per-session close path US-24's step 7 calls for each live session.
  */
 import { randomBytes } from 'node:crypto';
 import {
@@ -87,7 +101,11 @@ import {
   StreamableHTTPServerTransport,
   type StreamableHTTPServerTransportOptions,
 } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import {
+  isInitializeRequest,
+  type JSONRPCMessage,
+  type RequestId,
+} from '@modelcontextprotocol/sdk/types.js';
 
 import type { ServerConfig } from '../config.js';
 
@@ -127,6 +145,7 @@ import {
   type Serving,
   type ServingDeps,
   type ServingObserver,
+  type Surface,
 } from './runtime.js';
 
 // ---------------------------------------------------------------------------
@@ -177,8 +196,25 @@ function connectionsCheckingIntervalFor(bounds: ResolvedInboundBounds): number {
 const MCP_METHODS: ReadonlySet<string> = new Set(['POST', 'GET', 'DELETE', 'HEAD']);
 const PROBE_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 
-/** Session identifier entropy, in bytes. 24 bytes is 192 bits (NFR-30 wants ≥128). */
-const SESSION_ID_BYTES = 24;
+/**
+ * Session identifier entropy, in bytes (architecture §4.2).
+ *
+ * 32 bytes is 256 bits and 43 URL-safe characters. NFR-30's floor is 128 bits;
+ * the extra costs nothing and removes any argument about entropy accounting.
+ *
+ * **`randomUUID()` is deliberately NOT used**, departing from the SDK's own
+ * documented example. A v4 UUID carries 122 bits — six of its 128 are fixed
+ * version and variant markers — so it misses FR-77's floor, and the miss is
+ * INVISIBLE: a test that counts characters, or asserts uniqueness across 10 000
+ * draws, passes against it. That is why this story's entropy assertion is made
+ * on the DECODED BYTE LENGTH of the identifier rather than on its character
+ * count, which a base64 or hex encoding inflates without adding a bit.
+ */
+const SESSION_ID_BYTES = 32;
+
+/** The sweep interval is a quarter of the TTL, ceilinged. See `sessionSweepIntervalMs`. */
+const SESSION_SWEEP_DIVISOR = 4;
+const SESSION_SWEEP_CEILING_MS = 30_000;
 
 /**
  * What a caller arriving after the drain began is told (contract §5.14).
@@ -204,6 +240,102 @@ const SESSION_UNKNOWN_MESSAGE = 'The session identifier is not valid. Start a ne
 const SESSION_REQUIRED_MESSAGE = 'Bad Request: Mcp-Session-Id header is required';
 
 /**
+ * The cap refusal (operator contract §5.12), verbatim.
+ *
+ * It names BOTH variables and that is normative rather than helpful. Naming
+ * only `UNIFI_HTTP_MAX_SESSIONS` answers the wrong question in the common case:
+ * a server at the cap is far more often holding N zombie sessions than serving
+ * N live clients, and the second sentence is the actual fix. **Eviction is
+ * never used to make room** — a caller at the cap is told to wait or to reduce
+ * use, and no live session is ever terminated to admit a new one, because
+ * LRU-on-cap would turn a capacity control into a denial-of-service primitive
+ * that any secret-holder could aim at the operator's own client.
+ *
+ * No configured VALUE appears, only the variable names.
+ */
+const SESSION_LIMIT_MESSAGE =
+  'Session limit reached. This server is at its configured maximum of concurrent MCP ' +
+  'sessions. Raise UNIFI_HTTP_MAX_SESSIONS on the server and restart it, or close an idle ' +
+  'session; abandoned sessions are evicted after UNIFI_HTTP_SESSION_IDLE_TTL_MS.';
+
+/** The one JSON-RPC error code this module emits (contract §5.12, §5.14). */
+const JSON_RPC_SERVER_ERROR = -32000;
+/** Reserved for the unknown-session answer, so the two are never conflated. */
+const JSON_RPC_SESSION_UNKNOWN = -32001;
+
+// ---------------------------------------------------------------------------
+// The session primitives — ours in full (architecture §4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Draw one session identifier (architecture §4.2, FR-77, NFR-30).
+ *
+ * THE SINGLE EXPORTED GENERATOR, and `randomSource` is FR-77's byte-source spy
+ * rather than a configuration point. FR-77 requires proof that *exactly one*
+ * CSPRNG draw occurs per identifier and that no `Math.random` path exists; Node
+ * 20 has no `mock.module` to intercept `node:crypto`, so a default parameter is
+ * not one mechanism among several — it is the only one available. Production
+ * takes the default and the spy is inert.
+ *
+ * One `randomSource` call per identifier, by construction: there is exactly one
+ * call expression in the body and no fallback, retry or rejection-sampling loop
+ * that could draw twice for one identifier.
+ */
+export function createSessionId(
+  randomSource: (size: number) => Buffer = randomBytes,
+): string {
+  return randomSource(SESSION_ID_BYTES).toString('base64url');
+}
+
+/**
+ * The periodic sweep's interval: `min(ttl / 4, 30_000)` (architecture §4.3).
+ *
+ * Exported so the formula is assertable directly rather than inferred from
+ * timer behaviour. Floored at 1 ms so a pathological TTL cannot ask for a
+ * zero-delay interval, which Node would normalise to 1 anyway — stated so the
+ * normalisation is ours rather than the runtime's.
+ */
+export function sessionSweepIntervalMs(idleTtlMs: number): number {
+  return Math.max(1, Math.min(Math.floor(idleTtlMs / SESSION_SWEEP_DIVISOR), SESSION_SWEEP_CEILING_MS));
+}
+
+/** The bookkeeping `sessionIsIdle` reads. A subset of `SessionEntry`. */
+export interface SessionActivity {
+  readonly inFlightRequests: number;
+  readonly openStreams: number;
+  readonly lastActivityMs: number;
+}
+
+/**
+ * The idle predicate (architecture §4.3), pure and exported.
+ *
+ * **Idle means: no request in flight, no open stream, AND no request completed
+ * within the TTL.** The first two clauses are not belt-and-braces. A live,
+ * correctly-behaving MCP client that finished `initialize`, holds an SSE stream
+ * open and simply has nothing to ask for five minutes is idle under a
+ * last-activity-only predicate — and the SDK's own keep-alive writes are
+ * internal to the transport and invisible to this registry, so they cannot
+ * touch `lastActivityMs` without a hook this design does not add. The
+ * operator's own session, left open over lunch, would be terminated with a
+ * terminal error frame for no reason its client could diagnose.
+ *
+ * `lastActivityMs` is touched on request ARRIVAL AND COMPLETION. The completion
+ * half is the one that is easy to omit and expensive to omit: a tool call that
+ * legitimately runs longer than the TTL — three attempts at 25 s plus two
+ * honoured `Retry-After` waits is ~115 s at the defaults — would otherwise have
+ * its session evicted mid-call the moment its in-flight count returned to zero.
+ */
+export function sessionIsIdle(
+  session: SessionActivity,
+  nowMs: number,
+  idleTtlMs: number,
+): boolean {
+  if (session.inFlightRequests > 0) return false;
+  if (session.openStreams > 0) return false;
+  return nowMs - session.lastActivityMs >= idleTtlMs;
+}
+
+/**
  * Read a single header value.
  *
  * Node joins duplicate headers into an array for a few names; a session
@@ -212,6 +344,37 @@ const SESSION_REQUIRED_MESSAGE = 'Bad Request: Mcp-Session-Id header is required
  */
 function headerValue(raw: string | string[] | undefined): string | null {
   return typeof raw === 'string' && raw !== '' ? raw : null;
+}
+
+/**
+ * The caller's own JSON-RPC id, for the one response that echoes one.
+ *
+ * The CLIENT's identifier, never a session identifier — NFR-24 forbids echoing
+ * the latter anywhere, and nothing in this module ever does.
+ */
+function jsonRpcIdOf(body: unknown): RequestId | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const id = (body as { id?: unknown }).id;
+  return typeof id === 'string' || typeof id === 'number' ? id : null;
+}
+
+/**
+ * The request ids one inbound body leaves outstanding on its session.
+ *
+ * A message with no `method` is a response or an error and answers a request
+ * rather than opening one, so it never joins the set the terminal frame
+ * iterates. Batches are handled because the transport accepts them.
+ */
+function jsonRpcRequestIdsOf(body: unknown): RequestId[] {
+  const messages = Array.isArray(body) ? (body as unknown[]) : [body];
+  const ids: RequestId[] = [];
+  for (const message of messages) {
+    if (typeof message !== 'object' || message === null) continue;
+    if (typeof (message as { method?: unknown }).method !== 'string') continue;
+    const id = (message as { id?: unknown }).id;
+    if (typeof id === 'string' || typeof id === 'number') ids.push(id);
+  }
+  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +520,27 @@ export interface HttpServingDeps extends ServingDeps {
   hostAllowed?: (hostHeader: string | undefined, allow: readonly string[]) => boolean;
   /** Substitutes for the stderr stream, never for the composer. */
   warn?: (line: string) => void;
-  /** The session identifier draw. US-23 owns its entropy criteria. */
+  /**
+   * The session identifier draw. Defaults to the exported `createSessionId`,
+   * whose own `randomSource` default parameter is FR-77's byte-source spy —
+   * this seam substitutes the whole generator, that one substitutes its bytes.
+   */
   createSessionId?: () => string;
+  /**
+   * The per-session `McpServer` factory.
+   *
+   * Exists so a test can wrap the product and count `close()` per session, and
+   * so the FR-72 abort criterion can register a deliberately long-running tool
+   * handler and observe its `extra.signal` fire — the production factory funnels
+   * every handler through one action runner and hands it no `extra`.
+   */
+  createMcpServer?: (runtime: Runtime, surface: Surface) => McpServer;
+  /**
+   * The TTL sweep's periodic trigger. `unref()` is applied at the call site,
+   * NOT here, so substituting this seam cannot accidentally hand the sweep a
+   * claim on process lifetime that production does not give it.
+   */
+  createSweepInterval?: (onTick: () => void, intervalMs: number) => NodeJS.Timeout;
 }
 
 /**
@@ -648,12 +830,45 @@ interface RequestContext {
   authComplete: boolean;
 }
 
+/**
+ * Where an entry is in its life (architecture §4.3.1).
+ *
+ * `pending` exists because BOTH of the other available answers are wrong.
+ * Inserting at `onsessioninitialized` makes the cap read a count that lags
+ * every concurrent in-flight `initialize`, and — worse — a session whose
+ * `onsessioninitialized` has not yet fired is not in the registry when the
+ * drain iterates it, so its `McpServer` is never closed, `Protocol._onclose()`
+ * never runs and its handlers are never aborted. Inserting a `live` entry
+ * before dispatch makes 32 rejected `initialize` attempts fill the cap for a
+ * full TTL, because sweep-before-cap cannot help entries younger than the TTL.
+ * Reserve, insert `pending`, promote, and always release.
+ */
+type SessionState = 'pending' | 'live' | 'terminating';
+
+/**
+ * Why a session is being closed.
+ *
+ * `'disconnected'` is deliberately NOT a member: it is a `server.onclose`
+ * CAUSE, and it enters through `onSessionGone` — the bookkeeping path — never
+ * through the initiating one. Modelling it as a fourth reason is what made an
+ * earlier revision's single function circular.
+ */
+type TerminationReason = 'delete' | 'evicted' | 'drain';
+
 interface SessionEntry {
+  /** The registry key: a reservation token while pending, the id once live. */
+  key: string;
   readonly id: string;
   readonly server: McpServer;
   readonly transport: StreamableHTTPServerTransport;
+  state: SessionState;
   lastActivityMs: number;
-  inFlight: number;
+  /** `> 0` ⇒ never idle. Touched on arrival and completion. */
+  inFlightRequests: number;
+  /** `> 0` ⇒ never idle. A response that has not closed is an open stream. */
+  openStreams: number;
+  /** JSON-RPC request ids this session has not answered, for the terminal frame. */
+  readonly outstanding: Set<RequestId>;
 }
 
 // ---------------------------------------------------------------------------
@@ -688,7 +903,11 @@ export async function startHttp(
   const normalizeRoute = (deps.createRouteNormalizer ?? createRouteNormalizer)(serving.path);
   const matchBearer = deps.bearerMatches ?? bearerMatches;
   const hostIsAllowed = deps.hostAllowed ?? hostAllowed;
-  const drawSessionId = deps.createSessionId ?? defaultSessionId;
+  const drawSessionId = deps.createSessionId ?? createSessionId;
+  const buildMcpServer = deps.createMcpServer ?? createMcpServer;
+  const startSweepInterval =
+    deps.createSweepInterval ??
+    ((onTick: () => void, intervalMs: number) => setInterval(onTick, intervalMs));
   const createTransport =
     deps.createTransport ??
     ((transportOptions: StreamableHTTPServerTransportOptions) =>
@@ -701,7 +920,28 @@ export async function startHttp(
 
   const readiness: ReadinessState = createReadinessState();
   const ledger = createConnectionLedger(bounds.maxConnections);
+  /**
+   * The registry (architecture §4.1). Closure-scoped to one `startHttp()` call
+   * and never module-global, so two listeners in one test process — which every
+   * suite in this round creates — do not share sessions, a cap or a sweep.
+   */
   const sessions = new Map<string, SessionEntry>();
+  /**
+   * THE NUMBER THE CAP IS ENFORCED AGAINST, and it is not `sessions.size`.
+   *
+   * Both alternatives fail, in opposite directions. Checking `sessions.size`
+   * puts an `await` — the mandated pre-check sweep — in the middle of a
+   * check-then-act, so two concurrent `initialize`s at cap-1 both see room and
+   * take the registry over the cap. Decrementing it by firing teardown as
+   * `void terminateSession(...)` makes the count drop while N `McpServer`s, N
+   * transports and N sockets are still alive, so FR-77's assertion — made
+   * against this counter precisely so it does not flake — passes while the real
+   * resource count is over the cap. Incremented synchronously with no `await`
+   * between the test and the increment, and decremented when teardown COMPLETES.
+   */
+  let reserved = 0;
+  /** Distinguishes reservation tokens. Never derived from an identifier. */
+  let reservationSeq = 0;
   /** The effective write set, rendered into every log line's `writes=` field. */
   const writes = [...config.writesEnabled];
 
@@ -1041,7 +1281,7 @@ export async function startHttp(
         // The identifier is never echoed. `reject_reason=auth`, because
         // NFR-24's vocabulary is closed and `session_limit` means the cap was
         // reached rather than this identifier is unknown.
-        sendJsonRpc(ctx, 404, 'Not Found', -32001, SESSION_UNKNOWN_MESSAGE, 'auth');
+        sendJsonRpc(ctx, 404, 'Not Found', JSON_RPC_SESSION_UNKNOWN, SESSION_UNKNOWN_MESSAGE, 'auth');
         return;
       }
     }
@@ -1061,7 +1301,7 @@ export async function startHttp(
     // US-24 owns the pre-drain hold that makes this reachable for a bounded
     // window rather than only between `close()` and process exit.
     if (readiness.phase === 'draining') {
-      sendJsonRpc(ctx, 503, 'Service Unavailable', -32000, DRAIN_MESSAGE, 'draining');
+      sendJsonRpc(ctx, 503, 'Service Unavailable', JSON_RPC_SERVER_ERROR, DRAIN_MESSAGE, 'draining');
       return;
     }
 
@@ -1079,32 +1319,129 @@ export async function startHttp(
     // -- Step 13: MCP dispatch ------------------------------------------------
     observer?.onMcpRequest?.();
 
-    if (entry === undefined) {
-      if (ctx.method !== 'POST' || !isInitializeRequest(read.json)) {
-        // The SDK's own answer for a non-initialisation request carrying no
-        // session id, reproduced here because no transport exists to produce
-        // it: this request never reached one.
-        sendJsonRpc(ctx, 400, 'Bad Request', -32000, SESSION_REQUIRED_MESSAGE, 'auth');
-        return;
-      }
-      entry = await openSession();
+    if (entry !== undefined) {
+      // NFR-24's line is written AT HEADER FLUSH, not at completion, and
+      // `dur_ms` is therefore time-to-first-byte. That is the contract's cadence
+      // (§8.16) and on this endpoint it is the difference between an operator
+      // seeing a request line immediately and seeing it when the SSE stream
+      // finally closes — which for a long-lived MCP session can be hours. The
+      // wrapper is on THIS response object only and is discarded with it.
+      logAtHeaderFlush(ctx);
+      await dispatch(entry, ctx, read.json);
+      return;
     }
 
-    // NFR-24's line is written AT HEADER FLUSH, not at completion, and
-    // `dur_ms` is therefore time-to-first-byte. That is the contract's cadence
-    // (§8.16) and on this endpoint it is the difference between an operator
-    // seeing a request line immediately and seeing it when the SSE stream
-    // finally closes — which for a long-lived MCP session can be hours. The
-    // wrapper is on THIS response object only and is discarded with it.
-    logAtHeaderFlush(ctx);
+    if (ctx.method !== 'POST' || !isInitializeRequest(read.json)) {
+      // The SDK's own answer for a non-initialisation request carrying no
+      // session id, reproduced here because no transport exists to produce
+      // it: this request never reached one.
+      sendJsonRpc(ctx, 400, 'Bad Request', JSON_RPC_SERVER_ERROR, SESSION_REQUIRED_MESSAGE, 'auth');
+      return;
+    }
 
-    entry.lastActivityMs = now();
-    entry.inFlight += 1;
+    await admitSession(ctx, read.json);
+  }
+
+  /**
+   * The `initialize` admission decision: sweep, cap, reserve, dispatch, release.
+   *
+   * The ORDER of the first two is normative and was ratified rather than
+   * assumed (architecture §4.3). Without the pre-check sweep, `maxSessions`
+   * abandoned sessions block every new `initialize` for up to a full TTL and
+   * the only signal is `reject_reason=session_limit`, which cannot distinguish
+   * N live clients from N zombies — and a refusal can be wrong by up to a whole
+   * sweep interval's worth of already-dead sessions. The sweep is cheap: at
+   * most `maxSessions` entries against an injected clock.
+   */
+  async function admitSession(ctx: RequestContext, body: unknown): Promise<void> {
+    // 1. Sweep FIRST, and it is allowed to await precisely because step 2's
+    //    counter — not the map — is what the cap is enforced against.
+    await sweepIdleSessions(now());
+
+    // 2. Check and increment with NO `await` between them. Two concurrent
+    //    `initialize`s racing at cap-1 cannot both see room, because nothing
+    //    can interleave between these two statements.
+    if (reserved >= serving.maxSessions) {
+      // The refusal echoes the caller's own JSON-RPC id (contract §5.12); it is
+      // the client's, not ours, and it is the one response family in this module
+      // whose Content-Length therefore varies. AT THE CAP, EVICTION IS NEVER
+      // USED TO MAKE ROOM — no live session is terminated to admit this one.
+      sendJsonRpc(
+        ctx,
+        503,
+        'Service Unavailable',
+        JSON_RPC_SERVER_ERROR,
+        SESSION_LIMIT_MESSAGE,
+        'session_limit',
+        jsonRpcIdOf(body),
+      );
+      return;
+    }
+    reserved += 1;
+
+    let admitted: SessionEntry | null = null;
     try {
-      await entry.transport.handleRequest(ctx.req, ctx.res, read.json);
+      admitted = await openSession();
+      logAtHeaderFlush(ctx);
+      await dispatch(admitted, ctx, body);
     } finally {
-      entry.inFlight -= 1;
+      // THE HALF THAT CLOSES A TRIVIAL DENIAL OF SERVICE. An `initialize` the
+      // SDK rejects — a missing `Accept` member, a malformed message, a client
+      // in a reconnect loop — never reaches `onsessioninitialized`, so the
+      // entry is still `pending` here. Releasing only on success would let
+      // `maxSessions` rejected attempts fill the cap for a full TTL, and
+      // sweep-before-cap does not help because they are younger than it.
+      if (admitted === null) {
+        // Nothing was inserted; `openSession` threw. Release directly.
+        reserved -= 1;
+      } else if (admitted.state === 'pending') {
+        await terminateSession(admitted.key, 'evicted');
+      }
+    }
+  }
+
+  /**
+   * Hand one request to a session's transport, keeping the registry honest.
+   *
+   * Both idleness inputs are maintained here and nowhere else. `openStreams`
+   * counts responses that have not yet closed, which is a superset of the
+   * standalone `GET` SSE stream and is what makes "a session with an open
+   * stream is never idle" true for a POST whose SSE reply is still flowing too.
+   */
+  async function dispatch(
+    entry: SessionEntry,
+    ctx: RequestContext,
+    body: unknown,
+  ): Promise<void> {
+    const outstanding = jsonRpcRequestIdsOf(body);
+
+    // Arrival — the first half of "touched on arrival and completion".
+    entry.lastActivityMs = now();
+    entry.inFlightRequests += 1;
+    entry.openStreams += 1;
+    for (const id of outstanding) entry.outstanding.add(id);
+
+    let streamOpen = true;
+    const releaseStream = (): void => {
+      if (!streamOpen) return;
+      streamOpen = false;
+      entry.openStreams -= 1;
       entry.lastActivityMs = now();
+    };
+    ctx.res.once('close', releaseStream);
+
+    try {
+      await entry.transport.handleRequest(ctx.req, ctx.res, body);
+    } finally {
+      entry.inFlightRequests -= 1;
+      for (const id of outstanding) entry.outstanding.delete(id);
+      // Completion — the second half. Omitting it lets a request that ran
+      // longer than the TTL have its session evicted the instant it finishes.
+      entry.lastActivityMs = now();
+      // `close` is emitted asynchronously after `end()`; releasing eagerly for
+      // an already-finished response makes a sweep run in the very next turn
+      // see the truth rather than a stream that is open only on paper.
+      if (ctx.res.writableEnded || ctx.res.destroyed) releaseStream();
     }
   }
 
@@ -1148,11 +1485,30 @@ export async function startHttp(
    */
   async function openSession(): Promise<SessionEntry> {
     const id = drawSessionId();
+    // Keyed by a reservation token until the SDK confirms initialisation. The
+    // token is not a valid identifier and is never derived from one, so a
+    // caller presenting a harvested id cannot reach a half-built session.
+    const key = `pending#${(reservationSeq += 1)}`;
+
+    // Declared before the transport because the SDK's callbacks close over it
+    // and can, in principle, fire during `connect()`.
+    let entry: SessionEntry | null = null;
+
     const transport = createTransport({
       ...options.transportOptionsFor(id),
-      onsessionclosed: (closed: string) => {
-        const found = sessions.get(closed);
-        if (found !== undefined) void terminateSession(found);
+      // PROMOTION. `sdk-facts` §B.3: this fires INSIDE POST handling, after an
+      // await, which is exactly why the reservation exists and why the entry is
+      // already in the map by the time it runs.
+      onsessioninitialized: (minted: string) => {
+        if (entry !== null) promoteSession(entry, minted);
+      },
+      // `DELETE` ONLY. It does not fire from `close()` and it does not fire for
+      // an idle eviction — a design that waits for it to clean up after an
+      // eviction leaks every abandoned session, which is the exact failure
+      // FR-77 exists to prevent. Our registry deletes its own entry in every
+      // path; this callback is the client-asked path and nothing more.
+      onsessionclosed: async (closed: string) => {
+        await terminateSession(closed, 'delete');
       },
     });
 
@@ -1178,12 +1534,49 @@ export async function startHttp(
       },
       advertisedToolsFor: (surface) => core.advertisedToolsFor(surface),
     };
-    const server = createMcpServer(session, 'http');
+    const server = buildMcpServer(session, 'http');
+
+    // ==================================================================
+    // `server.onclose`, and `transport.onclose` IS NEVER ASSIGNED ANYWHERE.
+    //
+    // `connect()` replaces `transport.onclose` with a wrapper capturing
+    // whatever handler was set at that moment; assigning `transport.onclose`
+    // AFTER `connect()` overwrites that wrapper and silently disables
+    // `Protocol._onclose()` — no in-flight handler aborted through its
+    // `AbortSignal`, no request-timeout timer cleared, no pending request
+    // rejected, no error, no log line. It is a trap in the SDK's own API with
+    // no symptom at the point of the mistake, so a source scan asserts the
+    // literal absence rather than relying on a behavioural test alone.
+    // ==================================================================
+    server.server.onclose = (): void => {
+      if (entry !== null) onSessionGone(entry);
+    };
+
     await server.connect(transport);
 
-    const entry: SessionEntry = { id, server, transport, lastActivityMs: now(), inFlight: 0 };
-    sessions.set(id, entry);
+    entry = {
+      key,
+      id,
+      server,
+      transport,
+      state: 'pending',
+      lastActivityMs: now(),
+      inFlightRequests: 0,
+      openStreams: 0,
+      outstanding: new Set<RequestId>(),
+    };
+    sessions.set(key, entry);
     return entry;
+  }
+
+  /** Re-key a reserved entry under the identifier the SDK just minted. */
+  function promoteSession(entry: SessionEntry, minted: string): void {
+    if (entry.state !== 'pending') return;
+    sessions.delete(entry.key);
+    entry.key = minted;
+    entry.state = 'live';
+    entry.lastActivityMs = now();
+    sessions.set(minted, entry);
   }
 
   /**
@@ -1268,10 +1661,11 @@ export async function startHttp(
     code: number,
     message: string,
     rejectReason: RejectReason,
+    id: RequestId | null = null,
   ): void {
     if (!ctx.res.headersSent) {
       const body = Buffer.from(
-        JSON.stringify({ jsonrpc: '2.0', error: { code, message }, id: null }),
+        JSON.stringify({ jsonrpc: '2.0', error: { code, message }, id }),
         'utf8',
       );
       ctx.res.writeHead(status, reason, {
@@ -1330,6 +1724,23 @@ export async function startHttp(
     ledger.admit(socket);
   });
 
+  /**
+   * The sweep's SECOND trigger (architecture §4.3), driving the same function.
+   *
+   * The pre-`initialize` sweep is not sufficient on its own: a server that is
+   * abandoned entirely receives no further `initialize`, and FR-77 requires the
+   * map to return to zero after the TTL regardless of whether anyone asks.
+   *
+   * `unref()`'d — UNLIKE the outbound rate-limit sleep, where un-reffing would
+   * be wrong — because a periodic housekeeping sweep has no correctness claim
+   * on process lifetime, and a ref'd interval here would keep a finished test
+   * process, or a drained server, alive for a quarter of the TTL.
+   */
+  const sweepTimer = startSweepInterval(() => {
+    void sweepIdleSessions(now());
+  }, sessionSweepIntervalMs(serving.sessionIdleTtlMs));
+  sweepTimer.unref();
+
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error): void => reject(error);
     httpServer.once('error', onError);
@@ -1375,6 +1786,11 @@ export async function startHttp(
         /* the drain continues; every step is individually guarded */
       }
 
+      // The periodic sweep stops before the listener does: from here on the
+      // drain gate refuses every MCP method, so nothing can become idle that
+      // the explicit session close below will not reach anyway.
+      clearInterval(sweepTimer);
+
       observer?.onDrainStep?.('close-listener');
       await new Promise<void>((resolve) => {
         httpServer.close(() => resolve());
@@ -1386,7 +1802,10 @@ export async function startHttp(
       });
 
       observer?.onDrainStep?.('close-sessions');
-      for (const entry of [...sessions.values()]) await terminateSession(entry);
+      // Every entry, `pending` ones included: a session whose initialisation
+      // has not yet been confirmed is not invisible to the drain. US-24 owns
+      // the ordering, the per-session budget and the parallelism around this.
+      for (const key of [...sessions.keys()]) await terminateSession(key, 'drain');
 
       observer?.onDrainStep?.('close-runtime');
       try {
@@ -1411,22 +1830,21 @@ export async function startHttp(
         // promise still holding a reference to the runtime.
         await resolving.catch(() => undefined);
       },
+      /**
+       * RESERVATIONS, not map size (architecture §4.1, §4.3).
+       *
+       * The two agree except during an in-flight `initialize`, and that window
+       * is exactly the one the cap must not be blind to. FR-72 and FR-77 assert
+       * against this accessor rather than against a heap measurement, which
+       * would flake.
+       */
       sessionCount(): number {
-        return sessions.size;
+        return reserved;
       },
       connectionCounts(): { total: number; headroom: number } {
         return ledger.counts();
       },
-      async sweepIdleSessions(nowMs: number): Promise<number> {
-        let swept = 0;
-        for (const entry of [...sessions.values()]) {
-          if (entry.inFlight > 0) continue;
-          if (nowMs - entry.lastActivityMs < serving.sessionIdleTtlMs) continue;
-          await terminateSession(entry);
-          swept += 1;
-        }
-        return swept;
-      },
+      sweepIdleSessions,
       bounds(): ResolvedInboundBounds {
         return bounds;
       },
@@ -1437,24 +1855,146 @@ export async function startHttp(
   }
 
   /**
-   * Close one session through the same path an eviction and a drain take.
+   * THE INITIATING PATH: we decided to end this session.
    *
-   * `server.close()` rather than `transport.onclose = …`: `connect()` installs
-   * a wrapper on `onclose`, and overwriting it silently disables
-   * `Protocol._onclose()`, which is what aborts a session's in-flight handlers
-   * through the `AbortSignal` they received.
+   * One function for `DELETE`, eviction and drain, and US-24's drain step 7
+   * calls exactly this per live session rather than reimplementing any of it.
+   *
+   * **An eviction is this sequence, not a map delete.** No SDK callback fires
+   * for one — `onsessionclosed` is `DELETE`-only — so every step below is ours:
+   *
+   *   1. Look up and return if absent or already terminating (idempotent).
+   *   2. Mark terminating and delete OUR OWN registry entry first, so a
+   *      concurrent request cannot find a half-torn-down session — and so an
+   *      evicted identifier and one that never existed take the identical
+   *      step-11 branch from this instant onward.
+   *   3. Attempt the terminal frame, because `transport.close()` writes no
+   *      JSON-RPC frame at all and the client would otherwise see a silently
+   *      truncated stream. Skipped for `'delete'`, where the client asked and
+   *      gets its `200`.
+   *   4. `await server.close()`. This chains `Protocol.close()` →
+   *      `transport.close()` and, through the wrapper `connect()` installed,
+   *      runs `Protocol._onclose()` — which is what ABORTS EVERY IN-FLIGHT
+   *      REQUEST HANDLER'S `AbortController`. It also fires our `onclose` hook,
+   *      which finds no entry and returns.
+   *   5. Release the reservation, in a `finally`, when teardown has COMPLETED.
+   *
+   * NO SOCKET IS DESTROYED here, and that is a fix rather than an omission.
+   * HTTP/1.1 keep-alive does not partition by session, so a client — or an
+   * attacker — multiplexing two sessions over one connection would have session
+   * B's live SSE stream destroyed as collateral when A was evicted. The socket
+   * lingers until `keepAliveTimeout` instead. Bulk destruction stays where it
+   * is unambiguous: the drain's `closeAllConnections()`.
    */
-  async function terminateSession(entry: SessionEntry): Promise<void> {
-    sessions.delete(entry.id);
+  async function terminateSession(key: string, reason: TerminationReason): Promise<void> {
+    const entry = sessions.get(key);
+    if (entry === undefined || entry.state === 'terminating') return;
+
+    const wasLive = entry.state === 'live';
+    entry.state = 'terminating';
+    sessions.delete(key);
+
     try {
+      if (wasLive && reason !== 'delete') await sendTerminalFrame(entry);
       await entry.server.close();
     } catch {
       /* a session that failed to close cleanly must not stop the others */
+    } finally {
+      reserved -= 1;
     }
   }
 
-  function defaultSessionId(): string {
-    return randomBytes(SESSION_ID_BYTES).toString('base64url');
+  /**
+   * THE BOOKKEEPING PATH: the session is already gone.
+   *
+   * Hooked on `server.onclose`, so it also covers the cause that is not a
+   * termination reason at all — a transport that closed underneath us. It never
+   * calls `server.close()`, which is what stops the two paths recursing: an
+   * earlier revision hooked the initiating function here and the recursion
+   * terminated only by accident of ordering.
+   */
+  function onSessionGone(entry: SessionEntry): void {
+    if (entry.state === 'terminating') return;
+    if (sessions.get(entry.key) !== entry) return;
+    entry.state = 'terminating';
+    sessions.delete(entry.key);
+    reserved -= 1;
+  }
+
+  /**
+   * The terminal frame (architecture §3.4.1).
+   *
+   * A JSON-RPC error RESPONSE requires an `id` and a session-wide terminal
+   * notice has none, so the session-level frame is a notification; the
+   * per-request errors that follow carry each outstanding request's own id and
+   * are what let a client fail its pending calls deterministically rather than
+   * time them out. One message string for both, so an operator greps one thing.
+   *
+   * Every send is attempted and every failure is a no-op with no log line. The
+   * SDK's "a late send is silently discarded" guarantee is guarded on its own
+   * `_closed`, which is still `false` here — the normal state of a session that
+   * never opened a standalone `GET` stream — so a throw is expected, not
+   * exceptional.
+   */
+  async function sendTerminalFrame(entry: SessionEntry): Promise<void> {
+    const notification: JSONRPCMessage = {
+      jsonrpc: '2.0',
+      method: 'notifications/message',
+      params: { level: 'error', logger: 'unifi-mcp', data: DRAIN_MESSAGE },
+    };
+    try {
+      await entry.transport.send(notification);
+    } catch {
+      /* no open stream, or a peer applying backpressure. Not an error here. */
+    }
+
+    for (const id of entry.outstanding) {
+      const failure: JSONRPCMessage = {
+        jsonrpc: '2.0',
+        id,
+        error: { code: JSON_RPC_SERVER_ERROR, message: DRAIN_MESSAGE },
+      };
+      try {
+        await entry.transport.send(failure, { relatedRequestId: id });
+      } catch {
+        /* that request's stream is already gone; nothing to deliver it on */
+      }
+    }
+  }
+
+  /**
+   * The sweep's SELECTION half — synchronous, pure with respect to the clock.
+   *
+   * Split from the eviction half so the TTL is testable against an injected
+   * clock with no wall-clock waiting at all: 100 abandoned sessions are driven
+   * to zero by fast-forwarding a number, not by sleeping for a TTL.
+   *
+   * A `pending` entry is never selected. It is mid-`initialize`, its own
+   * `finally` releases it, and evicting it from underneath its dispatch would
+   * double-release the reservation.
+   */
+  function selectExpired(nowMs: number): string[] {
+    const expired: string[] = [];
+    for (const entry of sessions.values()) {
+      if (entry.state !== 'live') continue;
+      if (sessionIsIdle(entry, nowMs, serving.sessionIdleTtlMs)) expired.push(entry.key);
+    }
+    return expired;
+  }
+
+  /** The sweep's EVICTION half. Returns the count actually evicted. */
+  async function evictAll(keys: readonly string[]): Promise<number> {
+    let evicted = 0;
+    for (const key of keys) {
+      if (!sessions.has(key)) continue;
+      await terminateSession(key, 'evicted');
+      evicted += 1;
+    }
+    return evicted;
+  }
+
+  async function sweepIdleSessions(nowMs: number): Promise<number> {
+    return evictAll(selectExpired(nowMs));
   }
 
   function addressOf(server: Server): AddressInfo | null {

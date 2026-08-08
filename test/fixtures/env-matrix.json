@@ -1,0 +1,115 @@
+{
+  "$about": {
+    "owner": "test/config-contract.test.ts (US-26)",
+    "purpose": "The both-directions canary for QA case A6. It is NOT a corpus fixture and is never read by test/fixtures/load.ts, which discovers only <service>/pages and <service>/errors.",
+    "why": "A4 and A5 cross-reference the normative PRD tables against SCALAR_ENV_KEYS. A cross-reference that has never been observed to fail is a cross-reference nobody has proven is wired up. Each case below is a deliberately-drifted miniature of the real inputs, run through the SAME parser and the SAME compare function the real assertion uses, so a change that neuters either one turns these red.",
+    "note": "The variable names here are invented and must never be registered anywhere in src/."
+  },
+  "cases": [
+    {
+      "name": "a row in the table with no registration in the code",
+      "expect": {
+        "missingFromCode": ["UNIFI_HTTP_GHOST"],
+        "missingFromTable": []
+      },
+      "markdown": [
+        "#### 5.15.1 Serving-transport configuration surface (normative)",
+        "",
+        "Prose the parser must skip over before it reaches the table.",
+        "",
+        "| Variable | Default | Accepted values | Governed by |",
+        "|---|---|---|---|",
+        "| `UNIFI_HTTP_REAL` | `127.0.0.1` | an IPv4 literal | FR-63 |",
+        "| `UNIFI_HTTP_GHOST` | *(unset)* | documented but never registered | FR-63 |",
+        ""
+      ],
+      "registered": ["UNIFI_HTTP_REAL"]
+    },
+    {
+      "name": "a registration in the code with no row in the table",
+      "expect": {
+        "missingFromCode": [],
+        "missingFromTable": ["UNIFI_HTTP_ORPHAN"]
+      },
+      "markdown": [
+        "#### 5.15.1 Serving-transport configuration surface (normative)",
+        "",
+        "| Variable | Default | Accepted values | Governed by |",
+        "|---|---|---|---|",
+        "| `UNIFI_HTTP_REAL` | `127.0.0.1` | an IPv4 literal | FR-63 |",
+        ""
+      ],
+      "registered": ["UNIFI_HTTP_REAL", "UNIFI_HTTP_ORPHAN"]
+    },
+    {
+      "name": "both directions at once",
+      "expect": {
+        "missingFromCode": ["UNIFI_HTTP_GHOST"],
+        "missingFromTable": ["UNIFI_HTTP_ORPHAN"]
+      },
+      "markdown": [
+        "#### 5.15.1 Serving-transport configuration surface (normative)",
+        "",
+        "| Variable | Default | Accepted values | Governed by |",
+        "|---|---|---|---|",
+        "| `UNIFI_HTTP_REAL` | `127.0.0.1` | an IPv4 literal | FR-63 |",
+        "| `UNIFI_HTTP_GHOST` | *(unset)* | documented but never registered | FR-63 |",
+        ""
+      ],
+      "registered": ["UNIFI_HTTP_REAL", "UNIFI_HTTP_ORPHAN"]
+    },
+    {
+      "name": "agreement in both directions reports nothing",
+      "expect": {
+        "missingFromCode": [],
+        "missingFromTable": []
+      },
+      "markdown": [
+        "#### 5.15.1 Serving-transport configuration surface (normative)",
+        "",
+        "| Variable | Default | Accepted values | Governed by |",
+        "|---|---|---|---|",
+        "| `UNIFI_HTTP_REAL` | `127.0.0.1` | an IPv4 literal | FR-63 |",
+        ""
+      ],
+      "registered": ["UNIFI_HTTP_REAL"]
+    }
+  ],
+  "malformed": [
+    {
+      "name": "the heading is absent",
+      "because": "a renamed or renumbered section must fail loudly, never fall back to a built-in list",
+      "markdown": [
+        "#### 5.16 Something else entirely",
+        "",
+        "| Variable | Default |",
+        "|---|---|",
+        "| `UNIFI_HTTP_REAL` | `127.0.0.1` |",
+        ""
+      ]
+    },
+    {
+      "name": "the table under the heading has no body rows",
+      "because": "an emptied table would silently satisfy every forward assertion",
+      "markdown": [
+        "#### 5.15.1 Serving-transport configuration surface (normative)",
+        "",
+        "| Variable | Default |",
+        "|---|---|",
+        ""
+      ]
+    },
+    {
+      "name": "a body row whose first field is not a backticked UNIFI_ name",
+      "because": "field 1 is the parse contract; a row that does not obey it is a defect in the document, not a row to skip",
+      "markdown": [
+        "#### 5.15.1 Serving-transport configuration surface (normative)",
+        "",
+        "| Variable | Default |",
+        "|---|---|",
+        "| UNIFI_HTTP_REAL | `127.0.0.1` |",
+        ""
+      ]
+    }
+  ]
+}

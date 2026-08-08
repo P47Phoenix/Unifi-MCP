@@ -64,6 +64,18 @@ test/fixtures/
 └── mobility/{pages,errors}/
 ```
 
+### Files in this directory that are NOT part of the corpus
+
+`loadPageFixtures` / `loadErrorFixtures` discover by directory listing under
+`<service>/{pages,errors}` only, so nothing below is ever loaded as a fixture,
+carries the `$provenance` wrapper, or is subject to the format rules above.
+They live here because they are test DATA, and this is where test data lives.
+
+| Path | What it is | Read by |
+|---|---|---|
+| `env-matrix.json` | The both-directions canary for QA case A6: miniature drifted variable tables, plus three malformed ones, proving the §5.15.1 parser and its cross-reference can FAIL rather than only pass. | `test/config-contract.test.ts` (US-26) |
+| `loopback-cert.pem`, `loopback-key.pem` | The committed self-signed pair the FR-75 loopback origin serves. **The key is inert**: the origin is reached only under `UNIFI_LOCAL_TLS_INSECURE=true`, where neither expiry nor SAN is checked. Each file carries its own banner giving subject, validity, regeneration command and why it cannot rot. Node exposes no X.509 generation and FR-75 forbids a dev dependency, so generating one at test time is not available. | `test/harness/interceptor.ts` (US-25); see `test/harness/README.md` |
+
 ## Provenance by set
 
 | Set | Spec | Operation | Pointer |
