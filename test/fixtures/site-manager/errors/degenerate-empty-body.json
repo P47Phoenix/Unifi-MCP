@@ -1,0 +1,9 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "listSites (GET /v1/sites)",
+    "pointer": "#/paths/~1v1~1sites/get/responses/401/content/application~1json/schema",
+    "note": "Degenerate: a body that parsed but carries nothing. Every field the mapper reads is absent, so upstreamCode and correlationId must be null and message must fall back to a status-derived sentence rather than being empty."
+  },
+  "body": {}
+}

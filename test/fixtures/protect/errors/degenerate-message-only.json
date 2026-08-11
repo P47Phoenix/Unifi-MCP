@@ -1,0 +1,11 @@
+{
+  "$provenance": {
+    "spec": "specs/protect/v7.1.87/openapi.json",
+    "operation": "default response of GET /v1/cameras",
+    "pointer": "#/components/schemas/genericError",
+    "note": "Degenerate: neither required field is present, but a `message` is. Protect is the only service whose mapper has `message` as a secondary source, so the message must survive while upstreamCode stays null."
+  },
+  "body": {
+    "message": "service temporarily unavailable"
+  }
+}

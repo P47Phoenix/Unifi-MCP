@@ -1,0 +1,44 @@
+{
+  "name": "unifi-mcp",
+  "version": "0.1.0",
+  "description": "MCP server exposing the four published Ubiquiti UniFi developer APIs (Site Manager, Network, Protect, Mobility) as a single tool surface.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "unifi-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "specs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/run-tests.mjs",
+    "specs:refresh": "tsx scripts/refresh-specs.ts",
+    "specs:verify": "tsx scripts/verify-specs.ts",
+    "coverage:check": "tsx scripts/coverage-check.ts",
+    "budget:check": "tsx scripts/token-budget.ts",
+    "lint:tools": "tsx scripts/lint-tools.ts",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "inspect:cli": "npx @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list",
+    "inspect:cli:http": "set -e; SECRET=$(node -e \"process.stdout.write(require('node:crypto').randomBytes(24).toString('hex'))\"); LOG=$(mktemp); UNIFI_MCP_TRANSPORT=http UNIFI_HTTP_BIND=127.0.0.1 UNIFI_HTTP_PORT=0 UNIFI_HTTP_TOKEN=\"$SECRET\" UNIFI_API_KEY=\"${UNIFI_API_KEY:-inspect-cli-http-placeholder-key}\" UNIFI_CONSOLE_ID=\"${UNIFI_CONSOLE_ID:-0000000000000000}\" node dist/index.js 2>\"$LOG\" & SERVER=$!; trap 'kill $SERVER 2>/dev/null || true; rm -f \"$LOG\"' EXIT INT TERM; ENDPOINT=''; TRIES=0; while [ $TRIES -lt 150 ]; do ENDPOINT=$(sed -n 's#.*serving MCP over http at \\([^ ]*\\).*#\\1#p' \"$LOG\" | head -n 1); [ -n \"$ENDPOINT\" ] && break; kill -0 $SERVER 2>/dev/null || { cat \"$LOG\" >&2; echo 'unifi-mcp exited before it bound a listener' >&2; exit 1; }; TRIES=$((TRIES+1)); sleep 0.1; done; [ -n \"$ENDPOINT\" ] || { cat \"$LOG\" >&2; echo 'timed out waiting for the serving line' >&2; exit 1; }; echo \"inspect:cli:http -> http://$ENDPOINT\"; npx --yes \"@modelcontextprotocol/inspector${INSPECTOR_VERSION:+@$INSPECTOR_VERSION}\" --cli \"http://$ENDPOINT\" --transport http --header \"Authorization: Bearer $SECRET\" --method tools/list"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "~1.30.0",
+    "zod": "^3.23.8"
+  },
+  "optionalDependencies": {
+    "keytar": "^7.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

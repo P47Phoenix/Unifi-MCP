@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.env
+.DS_Store
+
+# Scratch directory used during development. scripts/refresh-specs.ts also
+# writes its generated PR body under .probe/spec-refresh/ — that is an input to
+# `gh pr create`, not a repository artifact.
+.probe/

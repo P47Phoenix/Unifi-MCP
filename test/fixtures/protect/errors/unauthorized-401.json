@@ -1,0 +1,12 @@
+{
+  "$provenance": {
+    "spec": "specs/protect/v7.1.87/openapi.json",
+    "operation": "default response of GET /v1/cameras",
+    "pointer": "#/components/schemas/genericError",
+    "note": "Required shape. correlationId must be null: Protect emits no trace or request id anywhere, and fabricating one would make an unsupportable error look supportable."
+  },
+  "body": {
+    "error": "API key is invalid or has been revoked",
+    "name": "UNAUTHORIZED"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "orphan schema — $ref'd by no operation in this spec version",
+    "pointer": "#/components/schemas/Error Message",
+    "note": "Degenerate: no code and no message. Network is the only service whose mapper has a second message source, so the message must fall back to statusName rather than to the generic no-parseable-body sentence."
+  },
+  "body": {
+    "requestPath": "/integration/v1/sites/123",
+    "statusCode": 401,
+    "statusName": "UNAUTHORIZED",
+    "timestamp": "2024-11-27T08:13:46.966Z"
+  }
+}

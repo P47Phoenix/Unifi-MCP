@@ -1,0 +1,17 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "orphan schema — $ref'd by no operation in this spec version",
+    "pointer": "#/components/schemas/Error Message",
+    "note": "Hand-derived: `Error Message` declares no required fields and no operation references it, so field presence is a judgement call. Dotted code with no recognised prefix, so the category comes from status."
+  },
+  "body": {
+    "code": "api.common.invalid-parameter",
+    "message": "Invalid value for parameter `limit`",
+    "requestId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "requestPath": "/integration/v1/sites/123/clients",
+    "statusCode": 400,
+    "statusName": "BAD_REQUEST",
+    "timestamp": "2024-11-27T08:13:46.966Z"
+  }
+}

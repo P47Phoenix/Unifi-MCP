@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/ErrorResponse",
+    "note": "FR-40 branch 2 of 4. Contains \"admin\" and \"workspace member\" but none of the scope triggers, so the hint must lead with the workspace Admin role."
+  },
+  "body": {
+    "code": "forbidden",
+    "httpStatusCode": 403,
+    "message": "caller is not an admin workspace member of the target workspace",
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c"
+  }
+}

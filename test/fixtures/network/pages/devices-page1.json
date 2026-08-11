@@ -1,0 +1,42 @@
+{
+  "$provenance": {
+    "spec": "specs/network/v10.4.57/openapi.json",
+    "operation": "getAdoptedDeviceOverviewPage (GET /v1/sites/{siteId}/devices)",
+    "pointer": "#/components/schemas/Adopted device overview page",
+    "note": "Single complete page (totalCount 2, offset 0) so nextCursor must be null even though limit exceeds the item count. Field values follow the per-property examples on #/components/schemas/Adopted device overview; states are drawn from its 10-value enum."
+  },
+  "body": {
+    "count": 2,
+    "limit": 25,
+    "offset": 0,
+    "totalCount": 2,
+    "data": [
+      {
+        "id": "9f1b0c2d-3e4f-5061-7283-94a5b6c7d8e9",
+        "name": "IW HD",
+        "model": "UHDIW",
+        "macAddress": "94:2a:6f:26:c6:ca",
+        "ipAddress": "192.168.1.55",
+        "state": "ONLINE",
+        "firmwareVersion": "6.6.55",
+        "firmwareUpdatable": false,
+        "supported": true,
+        "features": ["accessPoint", "switching"],
+        "interfaces": ["ports", "radios"]
+      },
+      {
+        "id": "9f1b0c2d-3e4f-5061-7283-94a5b6c7d8ea",
+        "name": "Depot Gateway",
+        "model": "UDMPRO",
+        "macAddress": "70:a7:41:97:83:ed",
+        "ipAddress": "192.168.1.1",
+        "state": "PENDING_ADOPTION",
+        "firmwareVersion": "4.3.6",
+        "firmwareUpdatable": true,
+        "supported": true,
+        "features": ["gateway", "switching"],
+        "interfaces": ["ports"]
+      }
+    ]
+  }
+}

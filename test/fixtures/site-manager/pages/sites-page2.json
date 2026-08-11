@@ -1,0 +1,27 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "listSites (GET /v1/sites)",
+    "pointer": "#/paths/~1v1~1sites/get/responses/200/content/application~1json/schema",
+    "note": "Terminal page of the cursor chain: nextToken is absent entirely, so nextCursor and truncation must both be null. Walking page1 then page2 must visit three sites and stop."
+  },
+  "body": {
+    "httpStatusCode": 200,
+    "traceId": "a7dc15e0eb4527142d7823515b15f87d",
+    "data": [
+      {
+        "siteId": "661de833b6b2463f0c20b31b",
+        "hostId": "900A6F00301100000000074A6BA90000000007A3387E0000000063EC9853:987654321",
+        "meta": { "desc": "Field Office", "gatewayMac": "70:a7:41:97:83:ef", "name": "default", "timezone": "America/Chicago" },
+        "statistics": {
+          "counts": { "criticalNotification": 0, "gatewayDevice": 1, "guestClient": 2, "lanConfiguration": 1, "offlineDevice": 0, "pendingUpdateDevice": 0, "totalDevice": 4, "wanConfiguration": 1, "wifiClient": 11, "wiredClient": 3 },
+          "internetIssues": [],
+          "ispInfo": { "name": "Chunghwa Telecom", "organization": "Data Communication Business Group" },
+          "percentages": { "wanUptime": 99.5 }
+        },
+        "permission": "admin",
+        "isOwner": true
+      }
+    ]
+  }
+}

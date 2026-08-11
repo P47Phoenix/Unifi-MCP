@@ -1,0 +1,13 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/ErrorResponse",
+    "note": "The FR-25 discriminator, negative side: `code` is absent, which is the only signal that the failure was passed through rather than minted by the gateway, so origin must be upstream. ErrorResponse requires only httpStatusCode and traceId, so this body is schema-valid."
+  },
+  "body": {
+    "httpStatusCode": 502,
+    "message": "upstream device management service unavailable",
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c"
+  }
+}

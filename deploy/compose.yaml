@@ -1,0 +1,98 @@
+# Reference Docker Compose deployment for the UniFi MCP server.
+#
+# The Kubernetes equivalent is deploy/kubernetes.yaml; the environment and the
+# grace period are the same, and the notes at the bottom of that file apply
+# here too.
+#
+# This file contains NO secret values. Both secrets are delivered as mounted
+# files that you create out of band, next to this file:
+#
+#   mkdir -p secrets && chmod 700 secrets
+#   head -c 48 /dev/urandom | base64 | tr -d '\n' > secrets/mcp-token
+#   printf %s "<your UniFi API key>" > secrets/unifi-api-key
+#   chmod 400 secrets/mcp-token secrets/unifi-api-key
+#
+# Add `secrets/` to the .gitignore of whatever repository you keep this copy in.
+# Nothing here reads a secret from a literal value, and nothing should.
+#
+# File delivery rather than `environment:` is deliberate: `docker inspect`
+# prints every literal environment value, and so does anything reading
+# /proc/<pid>/environ. A mounted file appears in neither.
+
+services:
+  unifi-mcp:
+    # Deploy by digest, never by a mutable tag. Rolling back means redeploying
+    # the previous digest, which the release provenance attestation records.
+    image: ghcr.io/p47phoenix/unifi-mcp@sha256:CHANGE_ME
+
+    # >= UNIFI_HTTP_SHUTDOWN_DEADLINE_MS (35000) + 15 s of headroom. Docker's
+    # default is 10 s, which SIGKILLs the process long before its drain
+    # completes. If you raise the deadline, raise this.
+    stop_grace_period: 50s
+    restart: unless-stopped
+    read_only: true                 # the server writes nothing to disk
+
+    environment:
+      # --- selecting the serving transport (inbound) ---------------------
+      UNIFI_MCP_TRANSPORT: "http"
+      # The default bind is 127.0.0.1, which is unreachable from outside the
+      # container's network namespace: the health check and any published port
+      # both fail. A container must bind 0.0.0.0.
+      UNIFI_HTTP_BIND: "0.0.0.0"
+      UNIFI_HTTP_PORT: "8787"
+      # The Host header your clients will actually send. A DNS-rebinding
+      # control, NOT an access control. If a reverse proxy sits in front,
+      # either it preserves the original Host, or you list the address it
+      # forwards to here. No X-Forwarded-* header is ever consulted.
+      UNIFI_HTTP_ALLOWED_HOSTS: "unifi-mcp.example.internal"
+
+      # --- secrets, by file ----------------------------------------------
+      # Compose mounts each entry of `secrets:` below at /run/secrets/<name>.
+      # The inbound shared secret MCP clients present. Not a UniFi credential.
+      # Minimum 32 characters.
+      UNIFI_HTTP_TOKEN_FILE: "/run/secrets/mcp-token"
+      # The UniFi cloud API key, likewise by file.
+      UNIFI_API_KEY_FILE: "/run/secrets/unifi-api-key"
+
+      # --- writes ----------------------------------------------------------
+      # Writes over HTTP need BOTH gates. Leaving either at `none` means
+      # unifi_execute_write_action is absent from tools/list. Enabling writes
+      # here means any caller holding the shared secret can change your UniFi
+      # estate.
+      UNIFI_ENABLE_WRITES: "none"
+      UNIFI_HTTP_ALLOW_WRITES: "none"
+
+    secrets:
+      - mcp-token
+      - unifi-api-key
+
+    ports:
+      # Published to the host's loopback only. The listener speaks plaintext
+      # HTTP and terminates no TLS: put a reverse proxy in front of it before
+      # anything but this host can reach it. Changing this to "8787:8787"
+      # publishes an unencrypted, key-holding listener on every interface.
+      - "127.0.0.1:8787:8787"
+
+    # Docker-native health under the HTTP transport. `--healthcheck` issues one
+    # local GET to /healthz and exits 0 on 200; under stdio the same flag falls
+    # back to the artifact self-test. Do not substitute `--selftest` here: it
+    # reports healthy for a wedged or unbound listener, and it forks a second
+    # Node interpreter that re-parses all four OpenAPI specs inside the same
+    # memory limit, which reads as an unexplained exit 137 on a 60 s cadence.
+    healthcheck:
+      test: ["CMD", "node", "dist/index.js", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      # Long enough that a slow first start — parsing four vendored OpenAPI
+      # specs and building the action registry before the listener binds —
+      # is not counted as a failure.
+      start_period: 60s
+      retries: 3
+
+    mem_limit: 512m
+
+secrets:
+  mcp-token:
+    file: ./secrets/mcp-token
+  unifi-api-key:
+    file: ./secrets/unifi-api-key

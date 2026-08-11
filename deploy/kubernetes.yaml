@@ -1,0 +1,207 @@
+# Reference deployment for the UniFi MCP server on Kubernetes.
+#
+# Copy this, change the marked values, and read the notes — several of the
+# numbers below are derived from the server's own shutdown budget and probe
+# behaviour, and changing one without the other reintroduces the failure it
+# exists to prevent. Every derivation is named inline.
+#
+# This manifest contains NO secret values. The shared secret and the UniFi API
+# key are delivered as mounted files from a Secret you create out of band:
+#
+#   head -c 48 /dev/urandom | base64 | tr -d '\n' > ./mcp-token
+#   printf %s "<your UniFi API key>" > ./unifi-api-key
+#   kubectl create secret generic unifi-mcp \
+#     --from-file=mcp-token=./mcp-token \
+#     --from-file=unifi-api-key=./unifi-api-key
+#   shred -u ./mcp-token ./unifi-api-key
+#
+# File delivery rather than `env:` is deliberate: `kubectl describe pod` and
+# `kubectl get pod -o yaml` print every literal `env:` value, and so does
+# `docker inspect` on the node. A mounted file appears in neither.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: unifi-mcp
+  labels:
+    app.kubernetes.io/name: unifi-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: unifi-mcp
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unifi-mcp
+  labels:
+    app.kubernetes.io/name: unifi-mcp
+spec:
+  # NOT an availability knob. Each replica keeps its own outbound rate-limit
+  # budget, so N replicas multiply the request rate against your console by N,
+  # and MCP sessions are process-local — a client routed to a second replica
+  # does not find its session. Multi-replica deployment is explicitly out of
+  # scope; leave this at 1.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: unifi-mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: unifi-mcp
+    spec:
+      # >= UNIFI_HTTP_SHUTDOWN_DEADLINE_MS (35000) + 15 s of headroom.
+      # The Kubernetes default is 30 s, which SIGKILLs the process at 30 s
+      # while it is still draining at 35 s — the one outcome the graceful
+      # shutdown path exists to avoid. If you raise the deadline, raise this.
+      terminationGracePeriodSeconds: 50
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000            # the image's `node` user
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: unifi-mcp
+          # Deploy by digest, never by a mutable tag. Rolling back means
+          # redeploying the previous digest, which the release provenance
+          # attestation records. `:latest` silently changes under you on any
+          # pod restart or node drain and leaves no rollback target.
+          image: ghcr.io/p47phoenix/unifi-mcp@sha256:CHANGE_ME
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # the server writes nothing to disk
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8787
+              protocol: TCP
+          env:
+            # --- selecting the serving transport (inbound) -----------------
+            - name: UNIFI_MCP_TRANSPORT
+              value: "http"
+            # The default bind is 127.0.0.1, which is unreachable from outside
+            # the container's network namespace: the kubelet's probes and the
+            # Service both fail. A container must bind 0.0.0.0.
+            - name: UNIFI_HTTP_BIND
+              value: "0.0.0.0"
+            - name: UNIFI_HTTP_PORT
+              value: "8787"
+            # The Host header your clients will actually send. This is a
+            # DNS-rebinding control, NOT an access control — the header is
+            # caller-supplied. If a proxy or ingress sits in front, either it
+            # preserves the original Host, or you list the address it forwards
+            # to here. No X-Forwarded-* header is ever consulted.
+            - name: UNIFI_HTTP_ALLOWED_HOSTS
+              value: "unifi-mcp.example.internal"
+
+            # --- secrets, by file --------------------------------------------
+            # The inbound shared secret MCP clients present. Not a UniFi
+            # credential. Minimum 32 characters.
+            - name: UNIFI_HTTP_TOKEN_FILE
+              value: "/run/secrets/unifi-mcp/mcp-token"
+            # The UniFi cloud API key, likewise by file.
+            - name: UNIFI_API_KEY_FILE
+              value: "/run/secrets/unifi-mcp/unifi-api-key"
+
+            # --- writes ------------------------------------------------------
+            # Writes over HTTP need BOTH gates. Leaving either at `none` means
+            # unifi_execute_write_action is absent from tools/list. Enabling
+            # writes here means any caller holding the shared secret can change
+            # your UniFi estate.
+            - name: UNIFI_ENABLE_WRITES
+              value: "none"
+            - name: UNIFI_HTTP_ALLOW_WRITES
+              value: "none"
+          volumeMounts:
+            - name: secrets
+              mountPath: /run/secrets/unifi-mcp
+              readOnly: true
+
+          # Covers a slow first start: the process parses four vendored OpenAPI
+          # specs and builds the action registry before it binds. Without a
+          # startupProbe that work races the liveness probe and gets the
+          # container killed during startup.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30      # up to 60 s to bind
+
+          # /readyz is process-local: `starting` -> `ready` -> `draining`. It
+          # does not depend on UniFi being reachable, so a Ubiquiti outage does
+          # not take your pod out of the Service.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+
+          # /healthz is a BIND-LIVENESS check: it answers 200 for as long as
+          # the process is listening, in every phase including drain.
+          # failureThreshold x periodSeconds must exceed
+          # UNIFI_HTTP_SHUTDOWN_DEADLINE_MS (35000), or the kubelet restarts
+          # the container part-way through its own graceful shutdown.
+          # 10 x 6 = 60 s > 35 s.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+
+          lifecycle:
+            # Belt and braces with the in-process pre-drain hold: this keeps
+            # the pod answering while endpoint removal propagates to kube-proxy
+            # and any ingress, so in-flight clients are not reset. Lengthen it
+            # here rather than rebuilding the image.
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
+
+      volumes:
+        - name: secrets
+          secret:
+            secretName: unifi-mcp
+            defaultMode: 0400
+            items:
+              - key: mcp-token
+                path: mcp-token
+              - key: unifi-api-key
+                path: unifi-api-key
+---
+# Three things to know before this is reachable by anyone but you:
+#
+# 1. The listener speaks PLAINTEXT HTTP. It terminates no TLS. Put an ingress,
+#    a service mesh or a reverse proxy in front of it and terminate TLS there.
+#    Exposed directly, the shared secret and every MCP request and response
+#    cross the network in the clear.
+#
+# 2. Restrict who can reach it at the network layer — a NetworkPolicy, or an
+#    ingress that authenticates. The shared secret and network policy are the
+#    controls that bound this exposure; the Host allow-list and the path are
+#    not access controls.
+#
+# 3. Local-direct Network and Protect calls go to your console's LAN address.
+#    A pod with no route to that network will advertise the full Network and
+#    Protect tool surface and fail every call at connect time. Either the pod
+#    can route to the console, or configure Cloud Connector instead.

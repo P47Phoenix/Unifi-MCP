@@ -1,0 +1,40 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "listHosts (GET /v1/hosts)",
+    "pointer": "#/paths/~1v1~1hosts/get/responses/200/content/application~1json/schema",
+    "note": "Single-page host listing carrying the DEFAULT_PROJECTIONS.host fields (id, type, ipAddress, isBlocked, owner). Reproduces two spec oddities on purpose: registrationTime/latestBackupTime are declared date-time but the spec's own example uses the empty string, and reportedState is null on the ucore example."
+  },
+  "body": {
+    "httpStatusCode": 200,
+    "traceId": "a7dc15e0eb4527142d7823515b15f87d",
+    "data": [
+      {
+        "id": "70A7419783ED0000000006797F060000000006C719490000000062ABD4EA:1261206302",
+        "hardwareId": "e5bf13cd-98a7-5a96-9463-0d65d78cd3a4",
+        "type": "ucore",
+        "ipAddress": "220.130.137.169",
+        "owner": true,
+        "isBlocked": false,
+        "registrationTime": "",
+        "lastConnectionStateChange": "2024-04-16T02:52:54.193Z",
+        "latestBackupTime": "",
+        "userData": { "apps": ["users"], "controllers": ["network", "protect"], "email": "operator@example.com", "fullName": "UniFi User", "role": "owner", "status": "ACTIVE" },
+        "reportedState": null
+      },
+      {
+        "id": "1d9cf3ee-0c0f-466e-933c-9af829f09b50",
+        "hardwareId": "b000b21e-0000-1111-add9-c1eed3897602",
+        "type": "network-server",
+        "ipAddress": "192.168.1.124",
+        "owner": true,
+        "isBlocked": true,
+        "registrationTime": "2024-02-07T10:25:21.981Z",
+        "lastConnectionStateChange": "2024-06-10T07:52:23.382Z",
+        "latestBackupTime": "",
+        "userData": { "apps": ["users"], "controllers": ["network"], "email": "contractor@example.com", "fullName": "Self-Hosted Admin", "role": "admin", "status": "ACTIVE" },
+        "reportedState": { "deviceId": "1d9cf3ee-0c0f-466e-933c-9af829f09b50", "hostname": "console.example.com", "ipAddrs": ["192.168.1.124"], "name": "Self-Hosted Site", "release_channel": "release", "state": "connected", "version": "8.3.11" }
+      }
+    ]
+  }
+}

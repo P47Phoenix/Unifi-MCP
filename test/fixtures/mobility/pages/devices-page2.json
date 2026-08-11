@@ -1,0 +1,20 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/DeviceListResponse",
+    "note": "Page 2 of 3. offset 3 + 3 returned is still short of total 7, so the chain continues with offset 6. Carries a device with the literal string state \"NULL\" and the empty mac_address the spec documents for an uninitialised unit."
+  },
+  "body": {
+    "total": 7,
+    "offset": 3,
+    "limit": 3,
+    "httpStatusCode": 200,
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c",
+    "data": [
+      { "id": "883fb733-15ce-74a7-da49-779988773333", "name": "Spare Router", "model": "UMR", "state": "ADOPTING", "firmware_version": "3.1.10", "mac_address": "00:1A:2B:3C:4D:60" },
+      { "id": "994fc844-26df-85b8-eb5a-88aa99884444", "name": "Uninitialised Unit", "model": "UMR", "state": "NULL", "firmware_version": "", "mac_address": "" },
+      { "id": "aa5fd955-37e0-96c9-fc6b-99bbaa995555", "name": "Loading Bay Router", "model": "UMR Industrial", "state": "RESTARTING", "firmware_version": "3.1.14", "mac_address": "00:1A:2B:3C:4D:61" }
+    ]
+  }
+}

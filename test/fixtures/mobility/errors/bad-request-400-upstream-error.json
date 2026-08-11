@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/mobility/v1.0.0/openapi.json",
+    "operation": "listDevices (GET /v1/mobility/workspaces/{workspaceID}/devices)",
+    "pointer": "#/components/schemas/ErrorResponse",
+    "note": "Spec-authentic and counter-intuitive: the 400 example uses code `upstream_error`, not `bad_request`. `code` is present, so origin must be gateway."
+  },
+  "body": {
+    "code": "upstream_error",
+    "httpStatusCode": 400,
+    "message": "invalid limit: must be between 1 and 200",
+    "traceId": "7f3a1c2b-d4e5-4f6a-8b9c-0d1e2f3a4b5c"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "listSites (GET /v1/sites)",
+    "pointer": "#/paths/~1v1~1sites/get/responses/200/content/application~1json/schema",
+    "note": "First page of a two-page cursor chain. A non-empty nextToken is the only thing that makes normalizePage mint a nextCursor for this service. Field values follow the spec's examples.ok.value; meta and statistics are untyped in the spec, so their inner shape is illustrative."
+  },
+  "body": {
+    "httpStatusCode": 200,
+    "traceId": "a7dc15e0eb4527142d7823515b15f87d",
+    "nextToken": "ba8e384e-3308-4236-b344-7357657351ca",
+    "data": [
+      {
+        "siteId": "661de833b6b2463f0c20b319",
+        "hostId": "900A6F00301100000000074A6BA90000000007A3387E0000000063EC9853:123456789",
+        "meta": { "desc": "Default", "gatewayMac": "70:a7:41:97:83:ed", "name": "default", "timezone": "Asia/Taipei" },
+        "statistics": {
+          "counts": { "criticalNotification": 0, "gatewayDevice": 1, "guestClient": 0, "lanConfiguration": 1, "offlineDevice": 0, "pendingUpdateDevice": 0, "totalDevice": 1, "wanConfiguration": 2, "wifiClient": 0, "wiredClient": 0 },
+          "internetIssues": [],
+          "ispInfo": { "name": "Chunghwa Telecom", "organization": "Data Communication Business Group" },
+          "percentages": { "wanUptime": 100 }
+        },
+        "permission": "admin",
+        "isOwner": true
+      },
+      {
+        "siteId": "661de833b6b2463f0c20b31a",
+        "hostId": "900A6F00301100000000074A6BA90000000007A3387E0000000063EC9853:123456789",
+        "meta": { "desc": "Warehouse Annex", "gatewayMac": "70:a7:41:97:83:ee", "name": "annex", "timezone": "Asia/Taipei" },
+        "statistics": {
+          "counts": { "criticalNotification": 1, "gatewayDevice": 1, "guestClient": 4, "lanConfiguration": 2, "offlineDevice": 2, "pendingUpdateDevice": 1, "totalDevice": 9, "wanConfiguration": 1, "wifiClient": 12, "wiredClient": 6 },
+          "internetIssues": [],
+          "ispInfo": { "name": "Chunghwa Telecom", "organization": "Data Communication Business Group" },
+          "percentages": { "wanUptime": 97.4 }
+        },
+        "permission": "readonly",
+        "isOwner": false
+      }
+    ]
+  }
+}

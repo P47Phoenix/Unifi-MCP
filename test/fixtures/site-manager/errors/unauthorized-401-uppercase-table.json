@@ -1,0 +1,14 @@
+{
+  "$provenance": {
+    "spec": "specs/site-manager/v1.0.0/openapi.json",
+    "operation": "listSites (GET /v1/sites)",
+    "pointer": "#/paths/~1v1~1sites/get/responses/401/content/application~1json/schema",
+    "note": "NOT observed in the spec. The uppercase twin of the 401 above: same category by a different route (table hit, not status fallthrough), so the two together prove the category is stable while upstreamCode differs."
+  },
+  "body": {
+    "code": "UNAUTHORIZED",
+    "httpStatusCode": 401,
+    "message": "api key rejected",
+    "traceId": "a7dc15e0eb4527142d7823515b15f87d"
+  }
+}
