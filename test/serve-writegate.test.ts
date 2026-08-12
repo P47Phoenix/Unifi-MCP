@@ -231,12 +231,22 @@ function renderedToolError(reason: unknown): string {
 // 1. AC 1a — the outbound refusal names both variables, over HTTP only
 // ===========================================================================
 
-/** Operator interface contract §5.9.2, verbatim. `{service}` is bound. */
+/**
+ * Operator interface contract §5.9.2, verbatim. `{service}` is bound.
+ *
+ * D-15 amended the message. The old text asserted here claimed "the effective
+ * set — the intersection of the two — is empty", and that sentence was FALSE
+ * every time this refusal fired: `unifi_execute_write_action` is not advertised
+ * at all when the effective set is empty (`src/tools/definitions.ts`), so the
+ * only way to reach this gate over HTTP is with a NON-empty set that excludes
+ * the named service. The message now says which service is missing, which is
+ * both true and the thing the operator has to act on.
+ */
 const HTTP_REFUSAL = [
   'network request failed (config).',
-  'Message: Write actions are disabled on the HTTP serving transport. Writes over HTTP ' +
-    'require both UNIFI_ENABLE_WRITES and UNIFI_HTTP_ALLOW_WRITES, and the effective set — ' +
-    'the intersection of the two — is empty.',
+  'Message: Write actions for network are disabled on the HTTP serving transport. Writes over ' +
+    'HTTP require both UNIFI_ENABLE_WRITES and UNIFI_HTTP_ALLOW_WRITES, and network is not in ' +
+    'the effective set — the intersection of the two.',
   'Next step: Set UNIFI_HTTP_ALLOW_WRITES to include this service on the server, then restart it.',
 ].join('\n');
 
@@ -525,6 +535,41 @@ describe('the write gate is never silent — both warnings, and only one at a ti
       validation.errors.join(' | '),
     );
   });
+
+  test('D-14 — refusal (c) also fires on two non-empty gates that do not intersect', () => {
+    // The configuration the guard used to miss, and the one the exploratory
+    // session started live: both variables set, neither empty, no service in
+    // common. The refusal's own stated hazard — "the effective HTTP write set
+    // would be empty and no write action could ever run" — is exactly as true
+    // here as it is with an empty `UNIFI_ENABLE_WRITES`, and this configuration
+    // used to start and serve a permanently dead write gate.
+    const env = httpEnv({ UNIFI_ENABLE_WRITES: 'network', UNIFI_HTTP_ALLOW_WRITES: 'protect' });
+    const config = load(env);
+    assert.deepEqual([...config.writesEnabledBySurface.stdio], ['network']);
+    assert.deepEqual([...config.writesEnabledBySurface.http], []);
+
+    const validation = validateConfig(config, env);
+    assert.equal(validation.ok, false, 'a dead write gate must refuse to start');
+
+    const refusal = validation.errors.find((line) => line.includes('UNIFI_HTTP_ALLOW_WRITES names'));
+    assert.ok(refusal, validation.errors.join(' | '));
+    // FR-73's second criterion: the message names both variables the operator
+    // has to reconcile, and it does NOT claim the base gate is empty — D-13's
+    // failure mode in the sibling warning, and the reason this case reports its
+    // own cause rather than reusing the empty-gate sentence.
+    assert.ok(refusal.includes('UNIFI_HTTP_ALLOW_WRITES names protect'), refusal);
+    assert.ok(refusal.includes('UNIFI_ENABLE_WRITES permits network'), refusal);
+    assert.equal(refusal.includes('UNIFI_ENABLE_WRITES is empty'), false, refusal);
+    assert.ok(refusal.includes('no write action could ever run'), refusal);
+  });
+
+  test('D-14 — a gate pair that DOES intersect still starts, so the guard is not a blanket', () => {
+    // The control. Without it, "refuse when the sets are disjoint" is satisfied
+    // by refusing whenever both variables are set at all.
+    const env = httpEnv({ UNIFI_ENABLE_WRITES: 'network,protect', UNIFI_HTTP_ALLOW_WRITES: 'protect' });
+    const validation = validateConfig(load(env), env);
+    assert.equal(validation.ok, true, validation.errors.join(' | '));
+  });
 });
 
 // ===========================================================================
@@ -632,6 +677,20 @@ const INVENTORY: readonly InventoryEntry[] = [
   {
     file: 'src/config.ts',
     expression: 'const baseWrites = config.writesEnabledBySurface.stdio;',
+    classification: 'diagnostic',
+  },
+  //
+  // ADDED BY THE D-14 FIX, and added rather than reclassified. Refusal (c) used
+  // to key on `baseWrites.size === 0` — one CAUSE of "the effective HTTP write
+  // set would be empty" — and so let two non-empty but disjoint gates start. It
+  // now reads the effective set the ONE narrowing already produced at load.
+  // `diagnostic`, unchanged: a startup refusal decides whether this process
+  // runs at all, never what an already-running process advertises or sends, and
+  // the sibling `baseWrites` read directly above it has always been classified
+  // this way for exactly that reason.
+  {
+    file: 'src/config.ts',
+    expression: 'const effectiveHttpWrites = config.writesEnabledBySurface.http;',
     classification: 'diagnostic',
   },
   {

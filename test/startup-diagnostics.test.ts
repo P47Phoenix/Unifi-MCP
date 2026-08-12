@@ -193,6 +193,62 @@ describe('the serving line — one line, after the readiness flag flips (FR-79, 
     assert.ok(only(lines, 'serving MCP over').includes('at 127.0.0.1:49152/mcp'));
   });
 
+  test('D-16 — every address-bearing line agrees with the serving line on the bound port', async () => {
+    // The defect this pins: under `UNIFI_HTTP_PORT=0` the serving line rendered
+    // the OS-assigned port while all THREE address-bearing warnings rendered
+    // `:0`, a bind/port pair that never existed — including the writes-enabled
+    // line, the most consequential security warning in the system.
+    //
+    // Asserted over ONE run, deliberately: the escape (finding F-6) was that
+    // the `listenAddress` seam had exactly one consuming test and it asserted
+    // only the serving line, so four lines that must agree were never compared
+    // in the same process. A per-line test would have passed against the
+    // defect; this one cannot.
+    // Two runs rather than one, for the reason §3.5's order test gives: `auth=none`
+    // is legal only on loopback (refusal (e)) and the plaintext warning fires only
+    // OFF loopback, so no startable process emits both. Each run still compares its
+    // own address-bearing lines against its own serving line, in its own process,
+    // which is the property that was missing.
+    const BOUND_PORT = 49173;
+    const writes = { UNIFI_ENABLE_WRITES: 'protect', UNIFI_HTTP_ALLOW_WRITES: 'protect' };
+
+    const loopback = await announced(httpEnv({ UNIFI_HTTP_PORT: '0', UNIFI_HTTP_AUTH: 'none', ...writes }), {
+      listenAddress: () => ({ address: '127.0.0.1', family: 'IPv4', port: BOUND_PORT }),
+    });
+    const routable = await announced(routableEnv({ UNIFI_HTTP_PORT: '0', ...writes }), {
+      listenAddress: () => ({ address: '0.0.0.0', family: 'IPv4', port: BOUND_PORT }),
+    });
+
+    const agreed: ReadonlyArray<readonly [string, readonly string[]]> = [
+      [
+        '127.0.0.1',
+        [
+          only(loopback, 'serving MCP over'),
+          only(loopback, 'UNIFI_HTTP_AUTH=none —'),
+          only(loopback, 'WARNING WRITES ENABLED OVER HTTP'),
+        ],
+      ],
+      [
+        '0.0.0.0',
+        [
+          only(routable, 'serving MCP over'),
+          only(routable, 'speaks plaintext HTTP'),
+          only(routable, 'WARNING WRITES ENABLED OVER HTTP'),
+        ],
+      ],
+    ];
+
+    for (const [bind, addressed] of agreed) {
+      for (const line of addressed) {
+        assert.ok(
+          line.includes(`${bind}:${BOUND_PORT}`),
+          `did not name the address the listener bound: ${line}`,
+        );
+        assert.equal(line.includes(`${bind}:0`), false, `rendered the configured :0 — ${line}`);
+      }
+    }
+  });
+
   test('stdio binds nothing, so it gets no serving line', async () => {
     const lines = await announced(stdioEnv());
     assert.equal(indexOfLine(lines, 'serving MCP over'), -1);
@@ -462,17 +518,33 @@ describe('§3.5 the warning order: plaintext, auth=none, routability, *_FILE, wr
     }
   });
 
-  test('the whole sequence precedes the bind — it is emitted by buildRuntimeCore', async () => {
+  test('the whole sequence is emitted at the bind, ahead of the registry and of `ready`', async () => {
     // FR-62 fixes validation and the refusals first, the bind second, the
-    // registry third. Everything ordered by §3.5 is on the stderr stream before
-    // `resolveRegistry` is ever called, so an operator sees it whether or not
-    // the registry resolves.
+    // registry third. This sequence is emitted at the SECOND of those, not the
+    // first — D-16: three of the five lines name the listener's address, and
+    // under `UNIFI_HTTP_PORT=0` there is no address to name until `listen()`
+    // resolves, so composing them in `buildRuntimeCore` rendered `:0` on the
+    // plaintext, `auth=none` and writes-enabled warnings while the serving line
+    // rendered the real port. What has NOT moved is the sequence's position
+    // relative to every other line: still ahead of the registry's own warnings,
+    // ahead of `ready`, ahead of the serving line, and still absent entirely
+    // from a refused start (asserted in §5 below).
     const { deps, lines } = capture(routableEnv({ UNIFI_ENABLE_WRITES: 'protect' }));
     const core = buildRuntimeCore(deps);
     try {
-      assert.ok(indexOfLine(lines, 'speaks plaintext HTTP') >= 0);
-      assert.ok(indexOfLine(lines, 'WARNING WRITES') >= 0);
-      assert.equal(indexOfLine(lines, 'ready —'), -1);
+      // Nothing yet: no listener exists, so no line that names one can be true.
+      assert.equal(indexOfLine(lines, 'speaks plaintext HTTP'), -1);
+      assert.equal(indexOfLine(lines, 'WARNING WRITES'), -1);
+
+      await resolveRegistry(core);
+      const plaintext = indexOfLine(lines, 'speaks plaintext HTTP');
+      const writePair = indexOfLine(lines, 'WARNING WRITES');
+      const ready = indexOfLine(lines, 'ready —');
+      assert.ok(plaintext >= 0, lines.join('\n'));
+      assert.ok(writePair >= 0, lines.join('\n'));
+      assert.ok(ready >= 0, lines.join('\n'));
+      assert.ok(plaintext < ready, `the warnings must precede ready:\n${lines.join('\n')}`);
+      assert.ok(writePair < ready, `the warnings must precede ready:\n${lines.join('\n')}`);
     } finally {
       await core.close();
     }
@@ -579,13 +651,12 @@ describe('a refused start emits no warnings (matching src/index.ts:99-105 pre-sp
   });
 
   test('the same configuration MINUS the refusal does warn — the scan proves something', async () => {
-    const { deps, lines } = capture(routableEnv({ UNIFI_ENABLE_WRITES: 'protect' }));
-    const core = buildRuntimeCore(deps);
-    try {
-      assert.ok(lines.length > 0);
-    } finally {
-      await core.close();
-    }
+    // The warnings are emitted at the bind (D-16), so the control has to reach
+    // the bind: `resolveRegistry` is the post-bind moment both this sequence
+    // and the serving line are emitted from.
+    const lines = await announced(routableEnv({ UNIFI_ENABLE_WRITES: 'protect' }));
+    assert.ok(lines.length > 0);
+    assert.ok(indexOfLine(lines, 'speaks plaintext HTTP') >= 0, lines.join('\n'));
   });
 });
 

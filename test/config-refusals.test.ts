@@ -72,7 +72,7 @@ import {
   MIN_SECRET_LENGTH,
   resolveBearerSlots,
 } from '../src/serve/auth.js';
-import { buildRuntimeCore } from '../src/serve/runtime.js';
+import { buildRuntimeCore, resolveRegistry } from '../src/serve/runtime.js';
 import {
   assertAbsentFromText,
   createInstruments,
@@ -954,7 +954,7 @@ describe('the NFR-23 adversarial matrix (A25)', () => {
     assert.equal(passed, RUNS, `only ${passed} of ${RUNS} runs were clean`);
   });
 
-  test('the opt-out that IS legal binds, and says so, in 20 of 20 runs (A26)', () => {
+  test('the opt-out that IS legal binds, and says so, in 20 of 20 runs (A26)', async () => {
     // NFR-23's second half: the one configuration that legitimately reaches an
     // unauthenticated listener has to announce itself, naming the bind address,
     // the port and the variable that re-enables authentication. Twenty runs,
@@ -975,7 +975,17 @@ describe('the NFR-23 adversarial matrix (A25)', () => {
           UNIFI_API_KEY: OUTBOUND_KEY,
         },
       });
-      buildRuntimeCore(instruments.deps);
+      const core = buildRuntimeCore(instruments.deps);
+      // The warning names the listener's bind and port, so it is composed and
+      // emitted at the bind rather than at core construction (D-16): under
+      // `UNIFI_HTTP_PORT=0` there is no port to name until `listen()` resolves.
+      // `resolveRegistry` is that moment, and it binds nothing itself — the
+      // `listen` counter this file asserts on is untouched by it.
+      try {
+        await resolveRegistry(core);
+      } finally {
+        await core.close();
+      }
       const warning = instruments.lines.find((line) => line.includes('UNIFI_HTTP_AUTH=none'));
       assert.ok(warning, `run ${run}: the opt-out emitted no warning`);
       assert.ok(warning.includes('127.0.0.1:8787'), 'the warning does not name bind and port');
