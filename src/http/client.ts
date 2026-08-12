@@ -233,6 +233,13 @@ export class UnifiClient {
     // inventory still holds at two. The branch exists because an operator on
     // HTTP has typically already set UNIFI_ENABLE_WRITES, and the
     // transport-agnostic text would tell them to do the thing they have done.
+    //
+    // D-15: the HTTP message names THIS SERVICE and never claims the effective
+    // set is empty. This branch is only reachable when the set is NON-empty —
+    // `unifi_execute_write_action` is not advertised, and so not callable, when
+    // it is empty (`src/tools/definitions.ts`, `writesEnabled.size === 0`) — so
+    // the old "the intersection … is empty" sentence was false on every single
+    // firing and told the operator to look at a set that was not the problem.
     if (action.actionClass === 'write' && !this.config.writesEnabled.has(action.service)) {
       const narrowedByHttpGate = this.config.activeSurface === 'http';
       throw new UnifiError(
@@ -240,9 +247,9 @@ export class UnifiClient {
           action.service,
           'config',
           narrowedByHttpGate
-            ? `Write actions are disabled on the HTTP serving transport. Writes over HTTP ` +
-              `require both UNIFI_ENABLE_WRITES and UNIFI_HTTP_ALLOW_WRITES, and the effective ` +
-              `set — the intersection of the two — is empty.`
+            ? `Write actions for ${action.service} are disabled on the HTTP serving transport. ` +
+              `Writes over HTTP require both UNIFI_ENABLE_WRITES and UNIFI_HTTP_ALLOW_WRITES, ` +
+              `and ${action.service} is not in the effective set — the intersection of the two.`
             : `Action \`${action.id}\` is a ${action.method} (state-changing) operation and ` +
               `writes are not enabled for ${action.service}.`,
           narrowedByHttpGate

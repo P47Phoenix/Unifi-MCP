@@ -91,12 +91,18 @@ const BASE_WRITE_SERVICES = 'network,protect';
  * `{service}` is bound from the `action_id` argument BEFORE the gate is
  * consulted, which is why a NETWORK action produces `network request failed`
  * even though network is outside the effective HTTP write set.
+ *
+ * D-15 amended the message: this refusal is reachable ONLY when the effective
+ * set is non-empty — the tool is unadvertised otherwise — so the old sentence
+ * claiming the intersection "is empty" was false on every firing. It now names
+ * the service that is missing from the set, which is what the operator has to
+ * add to `UNIFI_HTTP_ALLOW_WRITES`.
  */
 const HTTP_REFUSAL = [
   'network request failed (config).',
-  'Message: Write actions are disabled on the HTTP serving transport. Writes over HTTP ' +
-    'require both UNIFI_ENABLE_WRITES and UNIFI_HTTP_ALLOW_WRITES, and the effective set — ' +
-    'the intersection of the two — is empty.',
+  'Message: Write actions for network are disabled on the HTTP serving transport. Writes over ' +
+    'HTTP require both UNIFI_ENABLE_WRITES and UNIFI_HTTP_ALLOW_WRITES, and network is not in ' +
+    'the effective set — the intersection of the two.',
   'Next step: Set UNIFI_HTTP_ALLOW_WRITES to include this service on the server, then restart it.',
 ].join('\n');
 

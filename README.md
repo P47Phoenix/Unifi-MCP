@@ -384,6 +384,8 @@ None of this applies to the stdio default. Every variable below is read only whe
 | `UNIFI_HTTP_PORT` | `8787` | `0` … `65535` | FR-63 | Port the HTTP listener binds. `0` picks an OS-assigned port, reported on stderr at startup. |
 | `UNIFI_HTTP_PATH` | `/mcp` | an absolute path that does not normalise to `/healthz` or `/readyz` | FR-67, FR-73(d) | Path the MCP endpoint is served on. Must be absolute. The two probe paths are reserved and cannot be taken. |
 
+> `UNIFI_HTTP_PORT=0` is not supported with `--healthcheck` or any container or Kubernetes health check: the health command runs as a separate process from the server, has no way to discover the OS-assigned port, and dials the configured `0` — so it fails silently every time. Give any orchestrated deployment a fixed port; `0` is for local runs and test harnesses, which read the real port from the serving line on stderr.
+
 **Authenticating callers.**
 
 | Variable | Default | Accepted values | Governed by | Purpose |

@@ -684,15 +684,14 @@ describe('US-27 §3: an injected fault at any pre-authentication seam is still t
     // whose log collector went away. The response has already been flushed by
     // then, so the boundary's `res.headersSent` arm is what has to hold.
     //
-    // NOTE FOR REVIEW — a related gap is reported with this story and is
-    // deliberately NOT asserted here, because asserting it would mean pinning
-    // the defective behaviour as correct: a throw raised BEFORE the response is
-    // flushed, from inside `rejectUnauthenticated` itself, escapes the
-    // fail-closed boundary entirely (the catch handler calls the same emitter
-    // it is recovering with, and nothing wraps that call). See the story's
-    // findings. It is not attacker-reachable in production — the only
-    // components involved are Map operations and a precomputed write — which is
-    // why it is a finding rather than a failing test.
+    // The related gap this story reported as a finding — a throw raised BEFORE
+    // the response is flushed, from inside `rejectUnauthenticated` itself,
+    // escaping the fail-closed boundary because the catch handler called the
+    // same emitter it was recovering with — is D-06, and it is FIXED. It is
+    // asserted in §3b below rather than here, because it needs a fifth seam
+    // (`createThrottle`, which is inside the catch handler's own emission) and
+    // its observable is the absence of an unhandled rejection rather than the
+    // bytes on the wire.
     let armed = false;
     const bound = await boundServer(t, httpEnv(), {
       warn: () => {
@@ -707,6 +706,74 @@ describe('US-27 §3: an injected fault at any pre-authentication seam is still t
       assert.equal(captured.closedByServer, true);
     }
     armed = false;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. D-06 — the boundary's own emission is inside the boundary
+// ---------------------------------------------------------------------------
+
+/**
+ * The fifth seam, and the one the four above could not reach.
+ *
+ * All four inject inside `runPipeline`, so the boundary catches the fault and
+ * emits the uniform 401 from a healthy emitter. `createThrottle` is different:
+ * `rejectUnauthenticated` calls `throttle.record` and `throttle.isThrottled`
+ * BEFORE a byte is flushed, and the boundary's catch calls
+ * `rejectUnauthenticated`. A throttle that throws therefore faults the pipeline
+ * AND the recovery, which is the compound fault D-06 describes — and before the
+ * fix the second throw escaped the `catch` into the fire-and-forget
+ * `void (async …)()` wrapping it, becoming an unhandled rejection that Node
+ * 20's default `--unhandled-rejections=throw` turns into process death, with
+ * the caller's socket left open and zero bytes written.
+ *
+ * The observable is therefore not the wire — no response can be composed once
+ * the emitter itself is broken — but the process surviving. Finding F-7 is why
+ * this test exists at all: no test in the suite could reach `http.ts:1286-1288`.
+ */
+describe('US-27 §3b (D-06): the fail-closed boundary’s own emission cannot escape it', () => {
+  test('a throttle that throws kills no process and leaves no socket hanging', async (t) => {
+    const observed: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      observed.push(reason);
+    };
+
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const bound = await boundServer(t, httpEnv(), {
+        createThrottle: () => ({
+          record: () => {
+            throw new Error('injected throttle fault');
+          },
+          isThrottled: () => {
+            throw new Error('injected throttle fault');
+          },
+          size: () => 0,
+        }),
+      });
+
+      for (const [label, request] of rejectionClasses()) {
+        const captured = await exchange(bound.port, request);
+        // Nothing is composed — the composer is what faulted — but the socket
+        // is closed rather than held open forever on a response that can never
+        // arrive, and no fragment of a response is emitted.
+        assert.equal(captured.bytes.byteLength, 0, `${label} emitted bytes from a broken emitter`);
+        assert.equal(captured.closedByServer, true, `${label} left the socket open`);
+      }
+
+      // Two turns of the microtask queue: an unhandled rejection is reported on
+      // the tick AFTER the promise settles with no handler attached.
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+
+    assert.deepEqual(
+      observed.map((reason) => (reason instanceof Error ? reason.message : String(reason))),
+      [],
+      'the boundary let its own fault escape into the fire-and-forget wrapper',
+    );
   });
 });
 

@@ -726,6 +726,15 @@ const WRITE_GATE_INVENTORY: readonly InventoryEntry[] = [
     expression: 'const baseWrites = config.writesEnabledBySurface.stdio;',
     classification: 'diagnostic',
   },
+  // The D-14 fix: refusal (c) now reads the EFFECTIVE HTTP set — the condition
+  // it states — rather than the one cause of it that it used to key on. Still
+  // `diagnostic`: it decides whether the process starts, never what a started
+  // one advertises or sends.
+  {
+    file: 'src/config.ts',
+    expression: 'const effectiveHttpWrites = config.writesEnabledBySurface.http;',
+    classification: 'diagnostic',
+  },
   {
     file: 'src/config.ts',
     expression: 'const base = config.writesEnabledBySurface.stdio;',

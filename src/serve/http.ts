@@ -1282,10 +1282,31 @@ export async function startHttp(
           }
           return;
         }
-        if (ctx.authComplete && ctx.authenticated) {
-          complete(ctx, SERVER_ERROR_500, '-', 'ok');
-        } else {
-          rejectUnauthenticated(ctx, 'auth');
+        // D-06 — the boundary's OWN emission is guarded, for the same reason
+        // `res.end()` above is. `rejectUnauthenticated` calls `throttle.record`
+        // and `throttle.isThrottled` before a single byte is flushed; a throw
+        // from either (a compound fault: the throttle faulted while the
+        // pipeline is already faulted) escapes this `catch` into the
+        // fire-and-forget `void (async …)()` around it, where nothing handles
+        // it — an unhandled rejection, which under Node 20's default
+        // `--unhandled-rejections=throw` takes the whole process down and
+        // leaves the caller's socket open with zero response bytes.
+        try {
+          if (ctx.authComplete && ctx.authenticated) {
+            complete(ctx, SERVER_ERROR_500, '-', 'ok');
+          } else {
+            rejectUnauthenticated(ctx, 'auth');
+          }
+        } catch {
+          // Best-effort: the socket is destroyed so the caller fails fast
+          // rather than hanging on a response that can no longer be composed,
+          // and nothing else is safe to do here — every other emitter on this
+          // path is the one that just faulted.
+          try {
+            res.destroy();
+          } catch {
+            /* the socket was already gone; there is nothing left to close */
+          }
         }
       }
     })();

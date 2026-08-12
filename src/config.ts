@@ -459,6 +459,19 @@ function renderServiceList(services: Iterable<ServiceId>): string {
 /** `isIP` return code for IPv6, named so no bare `6` appears at a call site. */
 const IPV6_FAMILY = 6;
 
+/**
+ * The address a listener actually bound, structurally — `node:net`'s
+ * `AddressInfo` satisfies it.
+ *
+ * Declared rather than imported so this module keeps its dependency shape: it
+ * describes a deployment and never opens a socket, and the two fields below are
+ * the whole of what §3.3's rendering reads.
+ */
+export interface BoundAddress {
+  readonly address: string;
+  readonly port: number;
+}
+
 /** §0.1.4: `[::]:8787` for an IPv6 literal, `0.0.0.0:8787` otherwise. Never `:::8787`. */
 function renderAddress(bind: string, port: number): string {
   return isIP(bind) === IPV6_FAMILY ? `[${bind}]:${port}` : `${bind}:${port}`;
@@ -1146,18 +1159,35 @@ function collectServingProblems(
     );
   }
 
-  // (c) an HTTP write gate that can never open, because the base gate is shut.
+  // (c) an HTTP write gate that can never open.
+  //
+  // D-14: the guard is the CONDITION the refusal states — "the effective HTTP
+  // write set would be empty and no write action could ever run" — and not one
+  // of its causes. An empty UNIFI_ENABLE_WRITES is the obvious cause; two
+  // non-empty sets that do not intersect (`UNIFI_ENABLE_WRITES=network` with
+  // `UNIFI_HTTP_ALLOW_WRITES=protect`) produce exactly the same dead gate and
+  // used to start. The effective set is already computed once, at load, so the
+  // guard reads it rather than re-deriving the intersection here.
   const baseWrites = config.writesEnabledBySurface.stdio;
+  const effectiveHttpWrites = config.writesEnabledBySurface.http;
   if (
     !unresolved.has('allowWrites') &&
     (context.namesAll || context.named.size > 0) &&
-    baseWrites.size === 0
+    effectiveHttpWrites.size === 0
   ) {
     const subject = context.namesAll
       ? 'UNIFI_HTTP_ALLOW_WRITES is `all`'
       : `UNIFI_HTTP_ALLOW_WRITES names ${renderServiceList(context.named)}`;
+    // The two causes are named separately because the remedy differs: an empty
+    // base gate is opened by setting it, whereas two disjoint gates are fixed
+    // by making them overlap, and an operator told "UNIFI_ENABLE_WRITES is
+    // empty" when it demonstrably is not goes looking for a variable they set.
+    const cause =
+      baseWrites.size === 0
+        ? 'UNIFI_ENABLE_WRITES is empty'
+        : `UNIFI_ENABLE_WRITES permits ${renderServiceList(baseWrites)} and the two do not overlap`;
     errors.push(
-      `${subject} but UNIFI_ENABLE_WRITES is empty, so the effective HTTP write set would be ` +
+      `${subject} but ${cause}, so the effective HTTP write set would be ` +
         `empty and no write action could ever run. Set UNIFI_ENABLE_WRITES to the same services, ` +
         `or set UNIFI_HTTP_ALLOW_WRITES=none. Writes over HTTP need both gates; the effective ` +
         `set is the intersection.`,
@@ -1192,8 +1222,28 @@ function collectServingProblems(
     );
   }
 
-  warnings.push(...writeGateWarnings(config));
+  warnings.push(...writeGateWarnings(config, null));
   return { errors, warnings };
+}
+
+/**
+ * What the operator actually wrote in `UNIFI_HTTP_ALLOW_WRITES`, rendered.
+ *
+ * D-13: the narrowing warning used to hardcode `` `none` `` as the cause, so a
+ * narrowed-but-non-empty gate was reported as a value the operator never set —
+ * and the same startup's ready line printed the real one, so the log
+ * contradicted itself.
+ *
+ * S-08 still holds — the emitted narrowing line never names `all`. Not by
+ * suppressing the truth here, but because the configuration that would produce
+ * it (`all` over a base set naming no ENABLED service) has an empty effective
+ * HTTP set and is refused by (c) above, so the line is composed and never
+ * reaches a stream.
+ */
+function renderConfiguredAllowWrites(context: ServingContext): string {
+  if (context.namesAll) return '`all`';
+  if (context.named.size > 0) return renderServiceList(context.named);
+  return '`none`';
 }
 
 /**
@@ -1201,15 +1251,24 @@ function collectServingProblems(
  * them has to be told why and which variable to change; an operator who IS
  * getting them has to be told that the port now changes their estate.
  *
- * The narrowing line never names the value that grants the broadest authority,
- * and `renderServiceList` cannot produce it either — it renders `SERVICE_IDS`.
+ * `bound` is the address the listener actually got, and it is `null` at
+ * configuration load, where no listener exists yet (D-16). Under
+ * `UNIFI_HTTP_PORT=0` the configured port is the literal `0`, so composing this
+ * line from it renders `127.0.0.1:0` — a bind/port pair that never existed —
+ * on the single most consequential security warning in the system, while the
+ * adjacent serving line renders the real one. The caller that HAS a bound
+ * address passes it; the fallback is exactly what this function used to do.
  */
-function writeGateWarnings(config: ServerConfig): string[] {
+function writeGateWarnings(config: ServerConfig, bound: BoundAddress | null): string[] {
   const base = config.writesEnabledBySurface.stdio;
   const overHttp = config.writesEnabledBySurface.http;
+  const context = servingContexts.get(config);
 
   if (overHttp.size > 0) {
-    const address = renderAddress(config.serving.bind, config.serving.port);
+    const address = renderAddress(
+      bound?.address ?? config.serving.bind,
+      bound?.port ?? config.serving.port,
+    );
     return [
       `WARNING WRITES ENABLED OVER HTTP for ${renderServiceList(overHttp)} on ${address} — any ` +
         `caller presenting the shared secret can change your UniFi estate. Set ` +
@@ -1218,16 +1277,40 @@ function writeGateWarnings(config: ServerConfig): string[] {
   }
 
   if (base.size > 0) {
+    const configured = context === undefined ? '`none`' : renderConfiguredAllowWrites(context);
     return [
       `WARNING WRITES ARE DISABLED ON THIS TRANSPORT. UNIFI_ENABLE_WRITES permits ` +
-        `${renderServiceList(base)}, but UNIFI_HTTP_ALLOW_WRITES is \`none\`, so the effective ` +
-        `HTTP write set is empty: unifi_execute_write_action is absent from tools/list and every ` +
-        `write action will be refused. If that is intended, this line is your confirmation. If ` +
-        `it is not, widen UNIFI_HTTP_ALLOW_WRITES and restart.`,
+        `${renderServiceList(base)}, but UNIFI_HTTP_ALLOW_WRITES is ${configured}, so the ` +
+        `effective HTTP write set is empty: unifi_execute_write_action is absent from tools/list ` +
+        `and every write action will be refused. If that is intended, this line is your ` +
+        `confirmation. If it is not, widen UNIFI_HTTP_ALLOW_WRITES and restart.`,
     ];
   }
 
   return [];
+}
+
+/**
+ * The startup warnings §3.3 composes, re-composed against the address the
+ * listener actually bound (D-16).
+ *
+ * Exported because the composition has to happen TWICE and cannot happen only
+ * once in either place: `validateConfig` reports it as part of the validation
+ * verdict, before any listener exists, and the startup announcer emits it after
+ * `listen()` has resolved, which is the only moment the real port is knowable.
+ * One composer, two moments — the alternative is a second implementation of the
+ * §3.3 text somewhere with access to an `AddressInfo`, which is the duplication
+ * this module's own D-15 note warns about.
+ */
+export function writeGateWarningsFor(
+  config: ServerConfig,
+  bound: BoundAddress | null,
+): readonly string[] {
+  // The same IG-1 scoping `collectServingProblems` applies, stated once here so
+  // the caller cannot forget it: a stdio server binds no port, and neither §3.3
+  // line describes anything true of one.
+  if (config.serving.transport !== 'http') return [];
+  return writeGateWarnings(config, bound);
 }
 
 function isKnownEnvKey(key: string): boolean {

@@ -52,6 +52,7 @@ import {
   loadConfig,
   redactedSummary,
   validateConfig,
+  writeGateWarningsFor,
   type ConfigValidation,
   type LocalConsole,
   type ServerConfig,
@@ -320,6 +321,12 @@ interface RuntimeInternals {
   /** Trusted: lines this process composed from values it resolved itself. */
   readonly announce: (message: string) => void;
   readonly handlerContext: HandlerContext;
+  /**
+   * The ordered §3.5 warnings, composed against the bound address and emitted
+   * exactly once, at the bind (D-16). Cleared as it fires, so the idempotent
+   * second `resolveRegistry` call cannot print the sequence twice.
+   */
+  pendingStartupWarnings: ((bound: AddressInfo | null) => string[]) | null;
   registry: RegistryBuildResult | null;
   toolsBySurface: { readonly stdio: readonly ToolDefinition[]; readonly http: readonly ToolDefinition[] } | null;
   readyError: Error | null;
@@ -449,13 +456,21 @@ export function buildRuntimeCore(deps: RuntimeDeps = {}): RuntimeCore {
   // which is the part that is load-bearing.
   if (capture.problems.length > 0) throw new ConfigRefusal(capture.problems);
 
-  // 8. The ordered startup warnings (contract §3.5), before the bind and after
-  // every refusal. FR-79's routability warning in particular describes OUTBOUND
-  // reachability and is worth more to an operator before the listener exists
-  // than after the registry resolves.
-  for (const line of collectStartupWarnings(config, validation, capture.warnings, deps)) {
-    announce(line);
-  }
+  // 8. The ordered startup warnings (contract §3.5), COMPOSED after every
+  // refusal and EMITTED at the bind.
+  //
+  // They used to be emitted here, before the bind. D-16 is why they are not:
+  // three of the five name the listener's address, and under
+  // `UNIFI_HTTP_PORT=0` that address does not exist until `listen()` resolves,
+  // so composing here rendered `:0` on the plaintext, `auth=none` and
+  // writes-enabled warnings while the serving line rendered the real port.
+  //
+  // What is held is a THUNK over values this step has already resolved, so
+  // nothing about the ordered sequence below moves: a refused start still
+  // throws above and emits nothing at all, and the emitter still runs before
+  // the registry's own warnings, before `ready` and before the serving line.
+  const pendingStartupWarnings = (bound: AddressInfo | null): string[] =>
+    collectStartupWarnings(config, validation, capture.warnings, deps, bound);
 
   // The registry is not built yet, so the handler context starts empty and
   // `resolveRegistry` fills it. Every handler reads `ctx.actions` and
@@ -509,6 +524,7 @@ export function buildRuntimeCore(deps: RuntimeDeps = {}): RuntimeCore {
     warn,
     announce,
     handlerContext,
+    pendingStartupWarnings,
     registry: null,
     toolsBySurface: null,
     readyError: null,
@@ -539,6 +555,22 @@ export function resolveRegistry(core: RuntimeCore, deps: RuntimeDeps = {}): Prom
 
   const merged: RuntimeDeps = { ...state.deps, ...deps };
   state.resolving = (async () => {
+    // Read ONCE, and before anything else in this function: it is the bound
+    // address for both the ordered warnings (D-16) and the serving line, and
+    // the seam is a live read of `httpServer.address()` that a test may count.
+    // This runs after `listen()` resolved, which is what makes the OS-assigned
+    // port of `UNIFI_HTTP_PORT=0` knowable at all (FR-63).
+    const bound = merged.listenAddress?.() ?? null;
+
+    // The §3.5 sequence, outside the `try`: it is composed from configuration
+    // this process already resolved and cannot fail, and a registry fault must
+    // not swallow the warnings that describe how exposed this listener is.
+    const pending = state.pendingStartupWarnings;
+    if (pending !== null) {
+      state.pendingStartupWarnings = null;
+      for (const line of pending(bound)) state.announce(line);
+    }
+
     try {
       const readManifest = merged.readManifest ?? defaultReadManifest;
       const build = merged.buildRegistry ?? buildRegistry;
@@ -552,9 +584,11 @@ export function resolveRegistry(core: RuntimeCore, deps: RuntimeDeps = {}): Prom
       state.handlerContext.byId = registry.byId;
       state.registry = registry;
       state.toolsBySurface = precomputeAdvertisedTools(core.config);
-      // Read AFTER the registry resolved, which is after the bind, so the
-      // OS-assigned port of `UNIFI_HTTP_PORT=0` is available (FR-63).
-      announceStartup(core, state, merged.listenAddress?.() ?? null);
+      // `bound` was read at the top of this function, after the bind, so the
+      // OS-assigned port of `UNIFI_HTTP_PORT=0` is available (FR-63) — and the
+      // serving line and the ordered warnings above now render the SAME
+      // address, which is the whole of D-16.
+      announceStartup(core, state, bound);
     } catch (error) {
       state.readyError = error instanceof Error ? error : new Error(String(error));
       state.warn(`ERROR the action registry failed to resolve — ${state.readyError.message}`);
@@ -722,28 +756,54 @@ function shutdownBudgetWarning(config: ServerConfig): string | null {
  * The Windows warning is deliberately OUTSIDE the ordered five — the test
  * strategy's A-W asserts it "separately" — and leads, because it says the whole
  * deployment shape is unsupported, which dominates anything the five report.
+ *
+ * ## `bound`, and why the whole sequence is composed after the bind (D-16)
+ *
+ * Three of these lines carry an address: §3.6 plaintext, §3.2 auth=none and
+ * §3.3.2's write pair. `UNIFI_HTTP_PORT=0` — what the repo's own
+ * `inspect:cli:http` script and much of the HTTP corpus use — makes the
+ * CONFIGURED port the literal `0`, so all three rendered `127.0.0.1:0`, a
+ * bind/port pair that never existed, while `servingLine` two lines below
+ * rendered the real one because it already took the bound `AddressInfo`.
+ *
+ * The address is knowable only after `listen()` resolves, so the composition
+ * moved to the post-bind moment `servingLine` already occupies and takes the
+ * same parameter. It did NOT move relative to any other line: it is still
+ * emitted before the registry's own warnings, before `ready` and before the
+ * serving line, and a refused start still emits none of it, because
+ * `buildRuntimeCore` throws before it is ever composed.
  */
 function collectStartupWarnings(
   config: ServerConfig,
   validation: ConfigValidation,
   captureWarnings: readonly string[],
   deps: RuntimeDeps,
+  bound: AddressInfo | null,
 ): string[] {
   const serving = config.serving;
   const http = config.activeSurface === 'http';
-  const address = renderBindAddress(serving.bindAddress ?? serving.bind, serving.port);
+  const address = renderBindAddress(
+    bound?.address ?? serving.bindAddress ?? serving.bind,
+    bound?.port ?? serving.port,
+  );
   const routableBind = http && serving.bindAddress !== null && !isLoopbackBind(serving.bindAddress);
 
   // `validateConfig` returns one flat list holding three different populations.
   // The inbound `*_FILE` mode warnings are identified by identity against the
   // descriptor that produced them rather than by their text; the write pair by
   // its fixed opening; everything else is pre-existing and keeps its position.
+  //
+  // The write pair is DROPPED here and re-composed below against `bound`
+  // (D-16). `validateConfig` has to report it — it is part of the validation
+  // verdict and four suites read it there — but it composes at configuration
+  // load, where no port has been assigned. Same composer, called again with the
+  // address that now exists.
   const inboundFileWarnings = new Set<string>(serving.auth.warnings);
   const general: string[] = [];
   const fileMode: string[] = [];
-  const writePair: string[] = [];
+  const writePair: string[] = [...writeGateWarningsFor(config, bound)];
   for (const message of validation.warnings) {
-    if (message.startsWith(WRITE_GATE_WARNING_PREFIX)) writePair.push(message);
+    if (message.startsWith(WRITE_GATE_WARNING_PREFIX)) continue;
     else if (inboundFileWarnings.has(message)) fileMode.push(message);
     else general.push(message);
   }

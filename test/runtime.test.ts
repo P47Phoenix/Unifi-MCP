@@ -258,6 +258,11 @@ describe('buildRuntimeCore — the ordered startup sequence (FR-62, FR-78, NFR-3
       const { deps, seen } = harness({ UNIFI_API_KEY_FILE: path });
       const core = buildRuntimeCore(deps);
       try {
+        // The ordered §3.5 sequence — which the capture's warnings are folded
+        // into — is emitted at the bind rather than at core construction, so
+        // that the three address-bearing lines can name the port the listener
+        // actually got (D-16). `resolveRegistry` is that moment.
+        await resolveRegistry(core);
         assert.match(
           seen.lines.join('\n'),
           /readable by group or other/,
