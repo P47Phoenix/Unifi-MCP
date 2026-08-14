@@ -80,6 +80,31 @@ const siteIdArg = {
     .describe('Site identifier, as returned in the `id` field by unifi_list_sites.'),
 };
 
+/**
+ * Runtime, per-call console selection (FR-08, FR-10 extended to the tool
+ * surface). One MCP server instance may reach N consoles of different kinds —
+ * local UDM/UXG consoles and Cloud-Connector-proxied consoles — chosen per
+ * call rather than pinned once at process startup. Every field is optional
+ * and falls back to the existing environment-variable-based resolution
+ * (UNIFI_LOCAL_HOST/UNIFI_LOCAL_API_KEY, UNIFI_CONSOLE_ID/UNIFI_API_KEY) when
+ * omitted, so existing callers are unaffected.
+ *
+ * Inline keys (`consoleApiKey`, `cloudApiKey`) are used for this call only —
+ * never stored, never echoed back, never required to also exist as an
+ * environment variable.
+ */
+const localConsoleArgs: z.ZodRawShape = {
+  consoleHost: z.string().min(1).optional().describe('Local console host.'),
+  consoleApiKey: z.string().min(1).optional().describe('Local console key.'),
+};
+
+const cloudConsoleArgs: z.ZodRawShape = {
+  consoleId: z.string().min(1).optional().describe('Connector console id.'),
+  cloudApiKey: z.string().min(1).optional().describe('Cloud key.'),
+};
+
+const consoleSelectionArgs: z.ZodRawShape = { ...localConsoleArgs, ...cloudConsoleArgs };
+
 const fieldsArg = {
   fields: z
     .array(z.string().min(1))
@@ -135,8 +160,8 @@ export const LIST_DEVICES: ToolDefinition = {
   name: 'unifi_list_devices',
   description:
     'Lists UniFi infrastructure devices adopted by a site — access points, switches, gateways ' +
-    '— with model, state, and firmware. These serve the network; for the client machines using ' +
-    'it see unifi_list_clients. One site per call; site identifiers come from unifi_list_sites.',
+    '— with model, state, and firmware. For clients see unifi_list_clients. One site per call; ' +
+    'site identifiers come from unifi_list_sites.',
   annotations: {
     title: 'List UniFi network devices',
     readOnlyHint: true,
@@ -152,7 +177,7 @@ export const LIST_DEVICES: ToolDefinition = {
       .string()
       .optional()
       .describe(
-        "Network filter DSL expression, for example name.like('ap-*'). Validated before the request is sent.",
+        "Network filter DSL expression, e.g. name.like('ap-*').",
       ),
   },
   requiresService: 'network',
@@ -162,8 +187,7 @@ export const LIST_CLIENTS: ToolDefinition = {
   name: 'unifi_list_clients',
   description:
     'Lists client machines connected to a UniFi site — laptops, phones, IoT devices — with ' +
-    'hostname, IP, and connection details. These use the network; for the UniFi hardware ' +
-    'serving it see unifi_list_devices. One site per call.',
+    'hostname, IP, and connection details. For hardware see unifi_list_devices. One site per call.',
   annotations: {
     title: 'List UniFi clients',
     readOnlyHint: true,
@@ -179,7 +203,7 @@ export const LIST_CLIENTS: ToolDefinition = {
       .string()
       .optional()
       .describe(
-        "Network filter DSL expression, for example name.like('guest*'). Validated before the request is sent.",
+        "Network filter DSL expression, e.g. name.like('guest*').",
       ),
   },
   requiresService: 'network',
@@ -199,7 +223,7 @@ export const LIST_CAMERAS: ToolDefinition = {
     idempotentHint: true,
     openWorldHint: true,
   },
-  inputSchema: { ...paginationArgs(200, 25), ...fieldsArg },
+  inputSchema: { ...paginationArgs(200, 25), ...fieldsArg, ...consoleSelectionArgs },
   requiresService: 'protect',
 };
 
@@ -261,6 +285,7 @@ const executeArgs: z.ZodRawShape = {
     .record(z.union([z.string(), z.number(), z.boolean()]))
     .optional()
     .describe('Query-string parameters defined by the action schema.'),
+  ...consoleSelectionArgs,
 };
 
 export const EXECUTE_ACTION: ToolDefinition = {
@@ -268,8 +293,7 @@ export const EXECUTE_ACTION: ToolDefinition = {
   description:
     'Executes one read-only UniFi action by identifier, returning a normalized envelope with ' +
     'consistent pagination and error fields across all four APIs. A state-changing identifier ' +
-    'is rejected and names unifi_execute_write_action. Identifiers come from ' +
-    'unifi_search_actions. Wraps the Ubiquiti UniFi developer APIs at https://developer.ui.com.',
+    'is rejected and names unifi_execute_write_action. Wraps https://developer.ui.com.',
   annotations: {
     title: 'Execute a read-only UniFi action',
     readOnlyHint: true,

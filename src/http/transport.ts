@@ -55,6 +55,12 @@ export function resolveTarget(
   config: ServerConfig,
   service: ServiceId,
   host?: string,
+  /**
+   * Per-call Cloud Connector console override (the `consoleId` tool argument).
+   * Takes precedence over `config.consoleId`, so a caller may target an
+   * arbitrary console without UNIFI_CONSOLE_ID being set at all.
+   */
+  consoleIdOverride?: string,
 ): ResolvedTarget {
   if (service === 'site-manager' || service === 'mobility') {
     // FR-07 describes Mobility's base as `https://api.ui.com/v1/mobility`, but
@@ -68,7 +74,7 @@ export function resolveTarget(
   const mode = config.transport[service];
 
   if (mode === 'connector') {
-    const consoleId = config.consoleId;
+    const consoleId = consoleIdOverride ?? config.consoleId;
     if (!consoleId) {
       throw configError(
         service,
@@ -108,8 +114,9 @@ export function resolveBaseUrl(
   config: ServerConfig,
   service: ServiceId,
   host?: string,
+  consoleIdOverride?: string,
 ): { baseUrl: string; mode: TransportMode } {
-  const { baseUrl, mode } = resolveTarget(config, service, host);
+  const { baseUrl, mode } = resolveTarget(config, service, host, consoleIdOverride);
   return { baseUrl, mode };
 }
 
@@ -139,8 +146,9 @@ export function buildUrl(
   pathParams: Record<string, unknown> = {},
   query: Record<string, unknown> = {},
   host?: string,
+  consoleIdOverride?: string,
 ): string {
-  const { baseUrl } = resolveTarget(config, action.service, host);
+  const { baseUrl } = resolveTarget(config, action.service, host, consoleIdOverride);
   const url = new URL(baseUrl + renderPath(action, pathParams));
 
   for (const [key, value] of Object.entries(query)) {

@@ -18,6 +18,7 @@ import { Agent, request as httpsRequest } from 'node:https';
 import type { IncomingMessage } from 'node:http';
 
 import type { ServerConfig } from '../config.js';
+import { normalizeHost } from '../config.js';
 import type { CredentialStore } from '../credentials.js';
 import type { Action, ServiceId } from '../types.js';
 import { UnifiError } from '../types.js';
@@ -46,6 +47,41 @@ export interface UnifiClientOptions {
  * no parameter of that name, so it can never shadow a real API parameter.
  */
 export const CONSOLE_HOST_ARG = 'consoleHost';
+
+/**
+ * Inline API key for a LOCAL console targeted by `CONSOLE_HOST_ARG`.
+ *
+ * When supplied, it is used directly for THIS call only — never persisted,
+ * never cached, never handed to `CredentialStore` — and the console named by
+ * `consoleHost` need not be pre-registered via `UNIFI_LOCAL_HOST[_LABEL]` /
+ * `UNIFI_LOCAL_API_KEY[_LABEL]` at all. Same shadowing rule as
+ * `CONSOLE_HOST_ARG`: honoured only when the action itself declares no
+ * parameter of this name.
+ */
+export const CONSOLE_API_KEY_ARG = 'consoleApiKey';
+
+/**
+ * Per-call Cloud Connector console override, analogous to `CONSOLE_HOST_ARG`
+ * for connector mode. Lets a caller target an arbitrary console without
+ * UNIFI_CONSOLE_ID being set on the process at all.
+ */
+export const CONSOLE_ID_ARG = 'consoleId';
+
+/**
+ * Inline cloud API key, analogous to `CONSOLE_API_KEY_ARG` for cloud /
+ * Cloud-Connector-mode requests (Site Manager, Mobility, and Network/Protect
+ * in connector mode all authenticate with the single cloud key). Same
+ * never-persisted, never-logged treatment.
+ */
+export const CLOUD_API_KEY_ARG = 'cloudApiKey';
+
+/** Every reserved console-selection argument name, in one place. */
+const CONSOLE_SELECTION_ARGS: readonly string[] = [
+  CONSOLE_HOST_ARG,
+  CONSOLE_API_KEY_ARG,
+  CONSOLE_ID_ARG,
+  CLOUD_API_KEY_ARG,
+];
 
 /** Node TLS error codes that mean "the certificate did not verify" (FR-09). */
 const CERT_ERROR_CODES = new Set([
@@ -273,18 +309,31 @@ export class UnifiClient {
     if (this.draining) throw this.shutdownError(action.service, SHUTDOWN_RETRY_AFTER_SECONDS);
 
     const host = this.hostOverride(action, args);
-    const target = resolveTarget(this.config, action.service, host);
+    const consoleId = this.argOverride(action, args, CONSOLE_ID_ARG);
+    const inlineConsoleApiKey = this.argOverride(action, args, CONSOLE_API_KEY_ARG);
+    const inlineCloudApiKey = this.argOverride(action, args, CLOUD_API_KEY_ARG);
+    const target = resolveTarget(this.config, action.service, host, consoleId);
     const { pathParams, query, headerParams, body } = splitArgs(action, args);
-    const url = buildUrl(this.config, action, pathParams, query, host);
+    const url = buildUrl(this.config, action, pathParams, query, host, consoleId);
 
+    // A key supplied inline on THIS call is used directly and never reaches
+    // `CredentialStore` — no env-var fallback, no cache, no persistence. Local
+    // mode reads `consoleApiKey`; every other mode (cloud, connector) reads
+    // `cloudApiKey`, matching `CredentialStore.resolveFor`'s own split between
+    // a console-bound key and the single cloud key. Falls through to the
+    // existing env-var/keychain/file resolution exactly as before when no
+    // inline key was supplied — full backward compatibility.
+    const inlineApiKey = target.mode === 'local' ? inlineConsoleApiKey : inlineCloudApiKey;
     // The call, its arguments and its result are unchanged; the wrapper adds
     // only the drain-abandonment path (FR-70 step 3). An action parked here
     // holds no rate-limit token and has issued no request, so it is failed for
     // exactly the reason a queued limiter waiter is failed.
-    const apiKey = await this.abandonOnDrain(
-      this.credentials.resolveFor(action.service, target.mode, target.host),
-      action.service,
-    );
+    const apiKey =
+      inlineApiKey ??
+      (await this.abandonOnDrain(
+        this.credentials.resolveFor(action.service, target.mode, target.host),
+        action.service,
+      ));
     const bucketKey = bucketKeyFor(action, target);
 
     // FR-26: retries are for idempotent reads only. A write that fails is
@@ -506,8 +555,28 @@ export class UnifiClient {
   }
 
   private hostOverride(action: Action, args: Record<string, unknown>): string | undefined {
-    if (action.parameters.some((p) => p.name === CONSOLE_HOST_ARG)) return undefined;
-    const value = args[CONSOLE_HOST_ARG];
+    const raw = this.argOverride(action, args, CONSOLE_HOST_ARG);
+    if (raw === undefined) return undefined;
+    // The same light validation a pre-registered `UNIFI_LOCAL_HOST[_LABEL]`
+    // gets: strip a scheme/path a caller may have pasted. An inline host is
+    // not exempt from it just because it arrived on a tool call rather than
+    // through the environment.
+    const normalized = normalizeHost(raw);
+    return normalized === '' ? undefined : normalized;
+  }
+
+  /**
+   * One reserved console-selection argument, read only when the action itself
+   * declares no parameter of that name — so none of the four can ever shadow a
+   * real API parameter.
+   */
+  private argOverride(
+    action: Action,
+    args: Record<string, unknown>,
+    name: string,
+  ): string | undefined {
+    if (action.parameters.some((p) => p.name === name)) return undefined;
+    const value = args[name];
     return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
   }
 
@@ -795,7 +864,7 @@ function splitArgs(action: Action, args: Record<string, unknown>): SplitArgs {
   const pathParams: Record<string, unknown> = {};
   const query: Record<string, unknown> = {};
   const headerParams: Record<string, string> = {};
-  const declared = new Set<string>([CONSOLE_HOST_ARG]);
+  const declared = new Set<string>(CONSOLE_SELECTION_ARGS);
 
   for (const parameter of action.parameters) {
     declared.add(parameter.name);

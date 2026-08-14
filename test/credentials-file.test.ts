@@ -816,9 +816,15 @@ describe('Out of Scope #22: no credential ever arrives on the command line', () 
   });
 
   test('a secret passed as an argument is neither accepted nor echoed', () => {
-    const clean = Object.fromEntries(
-      Object.entries(process.env).filter(([k]) => !k.startsWith('UNIFI_')),
-    ) as NodeJS.ProcessEnv;
+    const clean = {
+      ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('UNIFI_'))),
+      // A server with NO console configured now STARTS (runtime per-call
+      // console selection), so it is no longer usable as this fixture's
+      // deterministic refusal. `UNIFI_MCP_TRANSPORT=http` with no
+      // UNIFI_HTTP_TOKEN still refuses fast, for a reason unrelated to
+      // console configuration and to the argv/env behaviour under test here.
+      UNIFI_MCP_TRANSPORT: 'http',
+    } as NodeJS.ProcessEnv;
     const run = (args: string[]): { status: number | null; stderr: string; stdout: string } => {
       const child = spawnSync(
         process.execPath,
