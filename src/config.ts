@@ -394,8 +394,16 @@ function readString(env: NodeJS.ProcessEnv, key: string): string | null {
   return trimmed === '' ? null : trimmed;
 }
 
-/** Strip a scheme/path a user may have pasted; base URLs are assembled, not copied. */
-function normalizeHost(raw: string): string {
+/**
+ * Strip a scheme/path a user may have pasted; base URLs are assembled, not
+ * copied.
+ *
+ * Exported so a per-call `consoleHost` override (client.ts's `hostOverride`)
+ * is normalised identically to a host that arrived through
+ * `UNIFI_LOCAL_HOST[_LABEL]` — an inline host is not exempt from the same
+ * light validation a pre-registered one gets.
+ */
+export function normalizeHost(raw: string): string {
   return raw
     .trim()
     .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
@@ -1402,21 +1410,26 @@ export function validateConfig(config: ServerConfig, env: NodeJS.ProcessEnv): Co
   }
   const serving = collectServingProblems(config, env);
   errors.push(...mutuallyExclusiveOptions, ...malformed, ...serving.errors);
+
+  // Runtime per-call console selection: a server with NO console configured at
+  // all via environment variables is no longer a startup refusal. Env-var
+  // consoles (if any) are defaults/fallbacks only — callers may supply a
+  // console target and credentials entirely at call time (`consoleHost` /
+  // `consoleApiKey` for local, `consoleId` / `cloudApiKey` for the Cloud
+  // Connector), so "no console is pre-configured" no longer means "no console
+  // is reachable". The `No UniFi API is usable` refusal this comment replaces
+  // is intentionally gone; only an informational note is emitted below.
+  const warnings = [...enabledWithoutCredentials];
   if (usableServices.length === 0) {
-    // FR-52: one cloud key is enough. Say exactly that rather than listing
-    // every knob the user did not set.
-    errors.push(
-      `No UniFi API is usable. The minimum viable configuration is a single cloud key: ` +
-        `set ${CLOUD_API_KEY_ENV} to enable Site Manager and Mobility. Network and Protect ` +
-        `additionally need either UNIFI_CONSOLE_ID (cloud connector) or ` +
-        `${DEFAULT_LOCAL_HOST_ENV} + ${DEFAULT_LOCAL_KEY_ENV} (local).`,
+    warnings.push(
+      `No console is pre-configured via environment variables (no ${CLOUD_API_KEY_ENV}, no ` +
+        `${DEFAULT_LOCAL_HOST_ENV}/UNIFI_LOCAL_HOST_<LABEL>, no UNIFI_CONSOLE_ID). This server ` +
+        `will still start: tool calls may supply a console target and credentials at call time ` +
+        `(consoleHost + consoleApiKey for a local console, or consoleId + cloudApiKey for the ` +
+        `Cloud Connector). Set environment-variable defaults instead if every call should target ` +
+        `the same console.`,
     );
   }
-
-  // An enabled-but-uncredentialed API degrades to a warning precisely because
-  // at least one other API works (FR-54); with none working it is already
-  // covered by the fatal error above.
-  const warnings = usableServices.length === 0 ? [] : [...enabledWithoutCredentials];
   if (config.localTlsInsecure) {
     const hosts = config.localConsoles.map((c) => c.host).join(', ') || '(none configured)';
     warnings.push(

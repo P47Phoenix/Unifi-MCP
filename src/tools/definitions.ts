@@ -80,6 +80,57 @@ const siteIdArg = {
     .describe('Site identifier, as returned in the `id` field by unifi_list_sites.'),
 };
 
+/**
+ * Runtime, per-call console selection (FR-08, FR-10 extended to the tool
+ * surface). One MCP server instance may reach N consoles of different kinds —
+ * local UDM/UXG consoles and Cloud-Connector-proxied consoles — chosen per
+ * call rather than pinned once at process startup. Every field is optional
+ * and falls back to the existing environment-variable-based resolution
+ * (UNIFI_LOCAL_HOST/UNIFI_LOCAL_API_KEY, UNIFI_CONSOLE_ID/UNIFI_API_KEY) when
+ * omitted, so existing callers are unaffected.
+ *
+ * Inline keys (`consoleApiKey`, `cloudApiKey`) are used for this call only —
+ * never stored, never echoed back, never required to also exist as an
+ * environment variable.
+ */
+const consoleSelectionArgs: z.ZodRawShape = {
+  consoleHost: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Local console to target for this call, for example 192.168.1.1. Overrides ' +
+        'UNIFI_LOCAL_HOST for local-direct Network/Protect requests. The console need not be ' +
+        'pre-registered via UNIFI_LOCAL_HOST_<LABEL> when consoleApiKey is also supplied.',
+    ),
+  consoleApiKey: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'API key for the console named by consoleHost, used for this call only and never ' +
+        'persisted. Required to reach a local console that is not pre-registered via ' +
+        'UNIFI_LOCAL_HOST[_LABEL] / UNIFI_LOCAL_API_KEY[_LABEL].',
+    ),
+  consoleId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Cloud Connector console id to proxy this call through, in the form unifi_list_consoles ' +
+        'returns. Overrides UNIFI_CONSOLE_ID; lets a call reach a console the server was not ' +
+        'started with.',
+    ),
+  cloudApiKey: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Cloud API key for this call only, used in place of UNIFI_API_KEY. Never persisted. ' +
+        'Applies to Site Manager, Mobility, and any Network/Protect request in Cloud Connector mode.',
+    ),
+};
+
 const fieldsArg = {
   fields: z
     .array(z.string().min(1))
@@ -109,7 +160,7 @@ export const LIST_CONSOLES: ToolDefinition = {
     idempotentHint: true,
     openWorldHint: true,
   },
-  inputSchema: { ...paginationArgs(500, 50), ...fieldsArg },
+  inputSchema: { ...paginationArgs(500, 50), ...fieldsArg, ...consoleSelectionArgs },
   requiresService: 'site-manager',
 };
 
@@ -127,7 +178,7 @@ export const LIST_SITES: ToolDefinition = {
     idempotentHint: true,
     openWorldHint: true,
   },
-  inputSchema: { ...paginationArgs(500, 50), ...fieldsArg },
+  inputSchema: { ...paginationArgs(500, 50), ...fieldsArg, ...consoleSelectionArgs },
   requiresService: 'site-manager',
 };
 
@@ -148,6 +199,7 @@ export const LIST_DEVICES: ToolDefinition = {
     ...siteIdArg,
     ...paginationArgs(200, 25),
     ...fieldsArg,
+    ...consoleSelectionArgs,
     filter: z
       .string()
       .optional()
@@ -175,6 +227,7 @@ export const LIST_CLIENTS: ToolDefinition = {
     ...siteIdArg,
     ...paginationArgs(200, 25),
     ...fieldsArg,
+    ...consoleSelectionArgs,
     filter: z
       .string()
       .optional()
@@ -199,7 +252,7 @@ export const LIST_CAMERAS: ToolDefinition = {
     idempotentHint: true,
     openWorldHint: true,
   },
-  inputSchema: { ...paginationArgs(200, 25), ...fieldsArg },
+  inputSchema: { ...paginationArgs(200, 25), ...fieldsArg, ...consoleSelectionArgs },
   requiresService: 'protect',
 };
 
@@ -261,6 +314,7 @@ const executeArgs: z.ZodRawShape = {
     .record(z.union([z.string(), z.number(), z.boolean()]))
     .optional()
     .describe('Query-string parameters defined by the action schema.'),
+  ...consoleSelectionArgs,
 };
 
 export const EXECUTE_ACTION: ToolDefinition = {

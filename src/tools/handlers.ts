@@ -15,6 +15,12 @@ import { normalizePage, clampPageSize, pageQueryParams } from '../http/paginatio
 import { renderUntrustedBlock } from '../safety/sanitize.js';
 import { applyPayloadCeiling, projectFields, projectionFor } from '../safety/truncate.js';
 import { NEVER_SHIP } from '../registry/blocklist.js';
+import {
+  CLOUD_API_KEY_ARG,
+  CONSOLE_API_KEY_ARG,
+  CONSOLE_HOST_ARG,
+  CONSOLE_ID_ARG,
+} from '../http/client.js';
 import type { WithheldMatch } from './search.js';
 import { searchActions, searchBlocklist } from './search.js';
 
@@ -191,6 +197,14 @@ function renderPage(
   };
 }
 
+/** The four runtime console-selection argument names, in pass-through order. */
+const CONSOLE_SELECTION_ARG_NAMES: readonly string[] = [
+  CONSOLE_HOST_ARG,
+  CONSOLE_API_KEY_ARG,
+  CONSOLE_ID_ARG,
+  CLOUD_API_KEY_ARG,
+];
+
 /** The single path from an action to a rendered result. */
 async function runAction(
   ctx: HandlerContext,
@@ -212,6 +226,13 @@ async function runAction(
   if (args.site_id) requestArgs.siteId = args.site_id;
   if (args.filter) requestArgs.filter = args.filter;
   if (args.body !== undefined) requestArgs.body = args.body;
+  // Runtime console selection: passed straight through to `UnifiClient.request`,
+  // which reads these four reserved names itself (`CONSOLE_HOST_ARG` and
+  // siblings in src/http/client.ts) and never forwards them into a request
+  // body or query string.
+  for (const key of CONSOLE_SELECTION_ARG_NAMES) {
+    if (args[key] !== undefined) requestArgs[key] = args[key];
+  }
 
   const response = await ctx.client.request(action, requestArgs);
 
